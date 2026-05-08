@@ -1,0 +1,13 @@
+{
+  "name": "profile-memory",
+  "label": "Memory",
+  "description": "View and safely edit profile USER.md and MEMORY.md files from the dashboard.",
+  "icon": "FileText",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/profile-memory",
+    "position": "after:config"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

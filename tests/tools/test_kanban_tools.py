@@ -986,3 +986,25 @@ def test_create_does_not_subscribe_gateway_origin_without_chat_id(monkeypatch, t
 
     with kb.connect() as conn:
         assert kb.list_notify_subs(conn, d["task_id"]) == []
+
+
+def test_complete_stale_run_error_is_structured(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        first_run_id = kb.latest_run(conn, worker_env).id
+        kb.reclaim_task(conn, worker_env, reason="simulate reclaim")
+        kb.claim_task(conn, worker_env, claimer="host:new")
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(first_run_id))
+
+    out = kt._handle_complete({"summary": "old worker done"})
+    err = json.loads(out)
+    assert err.get("error")
+    assert "stale_run" in err["error"]
+    assert f"expected_run_id={first_run_id}" in err["error"]
+    assert "current_run_id=" in err["error"]
+    assert "recovery" in err["error"].lower()

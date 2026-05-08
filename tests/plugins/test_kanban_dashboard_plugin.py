@@ -1117,6 +1117,11 @@ def test_create_task_probe_error_does_not_break_create(client, monkeypatch):
 @pytest.fixture
 def with_home_channels(monkeypatch):
     """Simulate a user with home channels set on telegram and discord."""
+    for var in [
+        "WEIXIN_TOKEN", "WEIXIN_ACCOUNT_ID", "WEIXIN_HOME_CHANNEL",
+        "WEIXIN_HOME_CHANNEL_NAME", "WEIXIN_HOME_CHANNEL_THREAD_ID",
+    ]:
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "abc:fake")
     monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "1234567")
     monkeypatch.setenv("TELEGRAM_HOME_CHANNEL_THREAD_ID", "42")
@@ -1254,6 +1259,8 @@ def test_home_channels_empty_when_no_homes_configured(client, monkeypatch):
         "TELEGRAM_BOT_TOKEN", "TELEGRAM_HOME_CHANNEL",
         "DISCORD_BOT_TOKEN", "DISCORD_HOME_CHANNEL",
         "SLACK_BOT_TOKEN",
+        "WEIXIN_TOKEN", "WEIXIN_ACCOUNT_ID", "WEIXIN_HOME_CHANNEL",
+        "WEIXIN_HOME_CHANNEL_NAME", "WEIXIN_HOME_CHANNEL_THREAD_ID",
     ]:
         monkeypatch.delenv(var, raising=False)
     r = client.get("/api/plugins/kanban/home-channels")

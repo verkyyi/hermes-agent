@@ -388,8 +388,20 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"kanban_create calls, or remove the created_cards field."
                 )
             if not ok:
+                ctx = kb.completion_rejection_context(
+                    conn, tid, expected_run_id=_worker_run_id(tid)
+                )
                 return tool_error(
-                    f"could not complete {tid} (unknown id or already terminal)"
+                    "could not complete {task_id}: {reason}; "
+                    "task_status={task_status}; current_run_id={current_run_id}; "
+                    "expected_run_id={expected_run_id}. {recovery_guidance}".format(
+                        task_id=ctx.get("task_id"),
+                        reason=ctx.get("reason"),
+                        task_status=ctx.get("task_status"),
+                        current_run_id=ctx.get("current_run_id"),
+                        expected_run_id=ctx.get("expected_run_id"),
+                        recovery_guidance=ctx.get("recovery_guidance"),
+                    )
                 )
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)

@@ -914,3 +914,143 @@ def test_latest_summaries_batch_omits_tasks_without_summary(kanban_home):
         assert out == {t1: "alpha", t3: "charlie"}
         # Empty input → empty dict, no SQL syntax error from "IN ()".
         assert kb.latest_summaries(conn, []) == {}
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle diagnostics / recovery regressions
+# ---------------------------------------------------------------------------
+
+def test_heartbeat_worker_extends_claim_for_owned_current_run(kanban_home):
+    """A run-scoped heartbeat should extend the active claim TTL.
+
+    This covers callers that use the DB API directly (not only the
+    kanban_heartbeat tool wrapper) and prevents long-running workers from
+    being reclaimed while they are actively heartbeating.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="long", assignee="alice")
+        claimed = kb.claim_task(conn, t, claimer="host:owned", ttl_seconds=60)
+        run_id = claimed.current_run_id
+        conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (1, t))
+        conn.execute("UPDATE task_runs SET claim_expires = ? WHERE id = ?", (1, run_id))
+
+        assert kb.heartbeat_worker(conn, t, note="still working", expected_run_id=run_id)
+
+        task = kb.get_task(conn, t)
+        run = kb.latest_run(conn, t)
+        assert task.claim_expires >= int(time.time()) + kb.DEFAULT_CLAIM_TTL_SECONDS - 5
+        assert run.claim_expires == task.claim_expires
+        assert kb.release_stale_claims(conn) == 0
+        assert kb.get_task(conn, t).status == "running"
+
+
+def test_stale_heartbeat_worker_does_not_extend_foreign_run(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stale", assignee="alice")
+        first = kb.claim_task(conn, t, claimer="host:first", ttl_seconds=60)
+        first_run_id = first.current_run_id
+        kb.reclaim_task(conn, t, reason="simulate reclaim")
+        second = kb.claim_task(conn, t, claimer="host:second", ttl_seconds=60)
+        second_run_id = second.current_run_id
+        conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (1, t))
+        conn.execute("UPDATE task_runs SET claim_expires = ? WHERE id = ?", (1, second_run_id))
+
+        assert not kb.heartbeat_worker(conn, t, note="old worker", expected_run_id=first_run_id)
+
+        task = kb.get_task(conn, t)
+        run = kb.latest_run(conn, t)
+        assert task.claim_expires == 1
+        assert run.claim_expires == 1
+
+
+def test_completion_rejection_context_identifies_stale_run(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="race", assignee="alice")
+        first = kb.claim_task(conn, t, claimer="host:first")
+        first_run_id = first.current_run_id
+        kb.reclaim_task(conn, t, reason="simulate stale worker")
+        second = kb.claim_task(conn, t, claimer="host:second")
+        ctx = kb.completion_rejection_context(conn, t, expected_run_id=first_run_id)
+
+        assert ctx["task_id"] == t
+        assert ctx["task_status"] == "running"
+        assert ctx["current_run_id"] == second.current_run_id
+        assert ctx["expected_run_id"] == first_run_id
+        assert ctx["reason"] == "stale_run"
+        assert "recovery_guidance" in ctx
+
+
+def test_recover_complete_blocked_task_preserves_audit_history(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="finished-but-blocked", assignee="alice")
+        kb.claim_task(conn, t, claimer="host:worker")
+        kb.block_task(conn, t, reason="gave_up after diagnostics")
+
+        ok = kb.recover_complete_task(
+            conn,
+            t,
+            summary="verified handoff from comment",
+            metadata={"source": "operator_verified_comment"},
+            recovered_by="operator",
+            reason="work completed after worker lifecycle failure",
+        )
+
+        assert ok
+        task = kb.get_task(conn, t)
+        assert task.status == "done"
+        run = kb.latest_run(conn, t)
+        assert run.outcome == "recovered_completed"
+        assert run.summary == "verified handoff from comment"
+        assert run.metadata["source"] == "operator_verified_comment"
+        events = kb.list_events(conn, t)
+        assert events[-1].kind == "recovered_completed"
+        assert events[-1].payload["recovered_by"] == "operator"
+
+
+def test_spawn_failure_payload_includes_log_tail(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="bad skill", assignee="alice")
+        kb.claim_task(conn, t, claimer="host:worker")
+        log_path = kb.worker_log_path(t)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("Error: Unknown skill(s): missing-skill\n", encoding="utf-8")
+
+        kb._record_spawn_failure(
+            conn,
+            t,
+            "pid 123 not alive",
+            failure_limit=1,
+            event_payload_extra=kb.failure_diagnostics(conn, t),
+        )
+
+        run = kb.latest_run(conn, t)
+        assert "Unknown skill(s): missing-skill" in run.metadata["worker_log_tail"]
+        gave_up = [e for e in kb.list_events(conn, t) if e.kind == "gave_up"][-1]
+        assert "Unknown skill(s): missing-skill" in gave_up.payload["worker_log_tail"]
+
+
+def test_dispatch_preflights_unknown_forced_skill_before_spawn(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="needs missing skill",
+            assignee="default",
+            skills=["missing-kanban-skill"],
+        )
+        called = {"spawn": False}
+
+        def spawn_fn(_task, _workspace):
+            called["spawn"] = True
+            return 123
+
+        result = kb.dispatch_once(conn, spawn_fn=spawn_fn, failure_limit=1)
+
+        assert not called["spawn"]
+        assert result.auto_blocked == [t]
+        task = kb.get_task(conn, t)
+        assert task.status == "blocked"
+        run = kb.latest_run(conn, t)
+        assert run.outcome == "gave_up"
+        assert "missing-kanban-skill" in run.error
+        assert run.metadata["preflight"] == "skills"
+        assert "missing-kanban-skill" in run.metadata["missing_skills"]

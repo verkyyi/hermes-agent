@@ -96,6 +96,7 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 # ``heartbeat_claim(task_id)`` periodically.  In practice most kanban
 # workloads either finish within 15m or set a longer claim explicitly.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
+DEFAULT_DIAGNOSTIC_TAIL_BYTES = 4096
 
 
 # Worker-context caps so build_worker_context() stays bounded on
@@ -1047,20 +1048,25 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "ON task_events(run_id, id)"
         )
 
-    notify_cols = {
-        row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")
-    }
-    if "notification_mode" not in notify_cols:
-        conn.execute(
-            "ALTER TABLE kanban_notify_subs ADD COLUMN "
-            "notification_mode TEXT NOT NULL DEFAULT 'direct'"
-        )
-    if "origin_session_id" not in notify_cols:
-        conn.execute("ALTER TABLE kanban_notify_subs ADD COLUMN origin_session_id TEXT")
-    if "origin_profile" not in notify_cols:
-        conn.execute("ALTER TABLE kanban_notify_subs ADD COLUMN origin_profile TEXT")
-    if "origin_context" not in notify_cols:
-        conn.execute("ALTER TABLE kanban_notify_subs ADD COLUMN origin_context TEXT")
+    notify_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='kanban_notify_subs'"
+    ).fetchone() is not None
+    if notify_table_exists:
+        notify_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")
+        }
+        if "notification_mode" not in notify_cols:
+            conn.execute(
+                "ALTER TABLE kanban_notify_subs ADD COLUMN "
+                "notification_mode TEXT NOT NULL DEFAULT 'direct'"
+            )
+        if "origin_session_id" not in notify_cols:
+            conn.execute("ALTER TABLE kanban_notify_subs ADD COLUMN origin_session_id TEXT")
+        if "origin_profile" not in notify_cols:
+            conn.execute("ALTER TABLE kanban_notify_subs ADD COLUMN origin_profile TEXT")
+        if "origin_context" not in notify_cols:
+            conn.execute("ALTER TABLE kanban_notify_subs ADD COLUMN origin_context TEXT")
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2195,6 +2201,153 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+_SECRETISH_RE = re.compile(
+    r"(?i)(api[_-]?key|token|secret|password|authorization)(\s*[:=]\s*)([^\s'\"]{8,})"
+)
+
+
+def _redact_diagnostic_text(text: str) -> str:
+    return _SECRETISH_RE.sub(r"\1\2[redacted]", text or "")
+
+
+def failure_diagnostics(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+    tail_bytes: int = DEFAULT_DIAGNOSTIC_TAIL_BYTES,
+) -> dict[str, Any]:
+    """Return bounded diagnostic context for crash/gave_up payloads."""
+    diagnostics: dict[str, Any] = {}
+    row = conn.execute(
+        """
+        SELECT t.last_heartbeat_at, t.claim_expires, t.current_run_id,
+               r.last_heartbeat_at AS run_last_heartbeat_at,
+               r.error AS run_error
+          FROM tasks t
+          LEFT JOIN task_runs r ON r.id = t.current_run_id
+         WHERE t.id = ?
+        """,
+        (task_id,),
+    ).fetchone()
+    if row:
+        last_hb = row["last_heartbeat_at"] or row["run_last_heartbeat_at"]
+        if last_hb is not None:
+            diagnostics["last_heartbeat_at"] = int(last_hb)
+        if row["claim_expires"] is not None:
+            diagnostics["claim_expires"] = int(row["claim_expires"])
+        if row["current_run_id"] is not None:
+            diagnostics["current_run_id"] = int(row["current_run_id"])
+        if row["run_error"]:
+            diagnostics["run_error"] = str(row["run_error"])[:500]
+    try:
+        log_tail = read_worker_log(task_id, tail_bytes=tail_bytes, board=board)
+    except Exception:
+        log_tail = None
+    if log_tail:
+        diagnostics["worker_log_tail"] = _redact_diagnostic_text(log_tail)[-tail_bytes:]
+    return diagnostics
+
+
+def completion_rejection_context(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int] = None,
+) -> dict[str, Any]:
+    """Explain why a run-scoped completion was rejected."""
+    row = conn.execute(
+        "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return {
+            "task_id": task_id,
+            "reason": "unknown_task",
+            "expected_run_id": expected_run_id,
+            "recovery_guidance": "Verify the task id and board before retrying.",
+        }
+    current_run_id = row["current_run_id"]
+    reason = "not_running_or_terminal"
+    if expected_run_id is not None and current_run_id != int(expected_run_id):
+        reason = "stale_run"
+    elif row["status"] in {"blocked", "done", "archived"}:
+        reason = "terminal_or_blocked"
+    return {
+        "task_id": task_id,
+        "reason": reason,
+        "task_status": row["status"],
+        "current_run_id": int(current_run_id) if current_run_id is not None else None,
+        "expected_run_id": int(expected_run_id) if expected_run_id is not None else None,
+        "claim_lock": row["claim_lock"],
+        "recovery_guidance": (
+            "This worker no longer owns the active run. Leave a durable comment "
+            "with the verified handoff, then an operator can use the audited "
+            "recovery completion path if the work is truly complete."
+        ),
+    }
+
+
+def recover_complete_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: str,
+    metadata: Optional[dict] = None,
+    result: Optional[str] = None,
+    recovered_by: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    """Audited operator recovery: mark blocked/gave_up work complete."""
+    if not summary and not result:
+        raise ValueError("summary or result is required for recovery completion")
+    now = int(time.time())
+    handoff = summary if summary is not None else result
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["status"] not in {"blocked", "ready"}:
+            return False
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status='done', result=?, completed_at=?, claim_lock=NULL,
+                   claim_expires=NULL, worker_pid=NULL, current_run_id=NULL,
+                   consecutive_failures=0, last_failure_error=NULL
+             WHERE id=? AND status IN ('blocked', 'ready')
+            """,
+            (result, now, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_cur = conn.execute(
+            """
+            INSERT INTO task_runs (
+                task_id, profile, status, started_at, ended_at, outcome,
+                summary, metadata
+            ) VALUES (?, ?, 'done', ?, ?, 'recovered_completed', ?, ?)
+            """,
+            (
+                task_id,
+                row["assignee"],
+                now,
+                now,
+                handoff,
+                json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
+            ),
+        )
+        run_id = int(run_cur.lastrowid)
+        payload = {
+            "summary": (handoff or "").strip().splitlines()[0][:400] or None,
+            "recovered_by": recovered_by,
+            "reason": reason,
+        }
+        _append_event(conn, task_id, "recovered_completed", payload, run_id=run_id)
+    recompute_ready(conn)
+    return True
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2957,18 +3110,19 @@ def heartbeat_worker(
     should be heartbeating (not running, or claim expired).
     """
     now = int(time.time())
+    expires = now + DEFAULT_CLAIM_TTL_SECONDS
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
+                "UPDATE tasks SET last_heartbeat_at = ?, claim_expires = ? "
                 "WHERE id = ? AND status = 'running'",
-                (now, task_id),
+                (now, expires, task_id),
             )
         else:
             cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
+                "UPDATE tasks SET last_heartbeat_at = ?, claim_expires = ? "
                 "WHERE id = ? AND status = 'running' AND current_run_id = ?",
-                (now, task_id, int(expected_run_id)),
+                (now, expires, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -2979,8 +3133,8 @@ def heartbeat_worker(
         )
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
-                (now, run_id),
+                "UPDATE task_runs SET last_heartbeat_at = ?, claim_expires = ? WHERE id = ?",
+                (now, expires, run_id),
             )
         _append_event(
             conn, task_id, "heartbeat",
@@ -3189,6 +3343,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            diag = failure_diagnostics(conn, row["id"])
+            if diag:
+                event_payload.update(diag)
+
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
@@ -3231,7 +3389,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             failure_limit=(1 if protocol_violation else None),
             release_claim=False,
             end_run=False,
-            event_payload_extra={"pid": pid, "claimer": claimer},
+            event_payload_extra={
+                "pid": pid,
+                "claimer": claimer,
+                **failure_diagnostics(conn, tid),
+            },
         )
         if tripped:
             auto_blocked.append(tid)
@@ -3337,16 +3499,19 @@ def _record_task_failure(
             run_id = None
             if end_run:
                 # Only the spawn path has an open run to close.
+                metadata = {
+                    "failures": failures,
+                    "trigger_outcome": outcome,
+                    "effective_limit": effective_limit,
+                    "limit_source": limit_source,
+                }
+                if event_payload_extra:
+                    metadata.update(event_payload_extra)
                 run_id = _end_run(
                     conn, task_id,
                     outcome="gave_up", status="gave_up",
                     error=error[:500],
-                    metadata={
-                        "failures": failures,
-                        "trigger_outcome": outcome,
-                        "effective_limit": effective_limit,
-                        "limit_source": limit_source,
-                    },
+                    metadata=metadata,
                 )
             payload = {
                 "failures": failures,
@@ -3382,15 +3547,21 @@ def _record_task_failure(
                 )
             if end_run:
                 # Spawn path: close the open run with outcome.
+                metadata = {"failures": failures}
+                if event_payload_extra:
+                    metadata.update(event_payload_extra)
                 run_id = _end_run(
                     conn, task_id,
                     outcome=outcome, status=outcome,
                     error=error[:500],
-                    metadata={"failures": failures},
+                    metadata=metadata,
                 )
+                payload = {"error": error[:500], "failures": failures}
+                if event_payload_extra:
+                    payload.update(event_payload_extra)
                 _append_event(
                     conn, task_id, outcome,
-                    {"error": error[:500], "failures": failures},
+                    payload,
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
@@ -3405,6 +3576,7 @@ def _record_spawn_failure(
     error: str,
     *,
     failure_limit: int = None,
+    event_payload_extra: Optional[dict] = None,
 ) -> bool:
     return _record_task_failure(
         conn, task_id, error,
@@ -3412,6 +3584,7 @@ def _record_spawn_failure(
         failure_limit=failure_limit,
         release_claim=True,
         end_run=True,
+        event_payload_extra=event_payload_extra,
     )
 
 
@@ -3488,6 +3661,55 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         if profile_exists(row["assignee"]):
             return True
     return False
+
+
+def _preflight_task_skills(task: Task) -> Optional[dict[str, Any]]:
+    """Validate forced task skills against the target profile before spawn."""
+    if not task.skills:
+        return None
+    try:
+        from hermes_cli.profiles import get_profile_dir, normalize_profile_name
+        from agent.skill_commands import build_preloaded_skills_prompt
+    except Exception as exc:
+        return {
+            "preflight": "skills",
+            "profile": task.assignee,
+            "error": f"skill preflight unavailable: {exc}",
+        }
+    profile = normalize_profile_name(task.assignee or "")
+    identifiers: list[str] = []
+    seen: set[str] = set()
+    for sk in ["kanban-worker", *(task.skills or [])]:
+        if sk and sk not in seen:
+            identifiers.append(sk)
+            seen.add(sk)
+    old_home = os.environ.get("HERMES_HOME")
+    old_profile = os.environ.get("HERMES_PROFILE")
+    try:
+        os.environ["HERMES_HOME"] = str(get_profile_dir(profile))
+        os.environ["HERMES_PROFILE"] = profile
+        _prompt, loaded, missing = build_preloaded_skills_prompt(
+            identifiers, task_id=task.id
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = old_home
+        if old_profile is None:
+            os.environ.pop("HERMES_PROFILE", None)
+        else:
+            os.environ["HERMES_PROFILE"] = old_profile
+    if missing:
+        return {
+            "preflight": "skills",
+            "profile": profile,
+            "forced_skills": identifiers,
+            "loaded_skills": loaded,
+            "missing_skills": missing,
+            "error": f"Unknown skill(s): {', '.join(missing)} for profile {profile}",
+        }
+    return None
 
 
 def dispatch_once(
@@ -3612,6 +3834,18 @@ def dispatch_once(
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
+        preflight = _preflight_task_skills(claimed)
+        if preflight:
+            auto = _record_spawn_failure(
+                conn,
+                claimed.id,
+                preflight.get("error") or "forced skill preflight failed",
+                failure_limit=failure_limit,
+                event_payload_extra=preflight,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -3638,9 +3872,13 @@ def dispatch_once(
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
+            diagnostics = failure_diagnostics(conn, claimed.id, board=board)
             auto = _record_spawn_failure(
-                conn, claimed.id, str(exc),
+                conn,
+                claimed.id,
+                str(exc),
                 failure_limit=failure_limit,
+                event_payload_extra=diagnostics,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)

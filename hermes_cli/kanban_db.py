@@ -4227,11 +4227,17 @@ def add_notify_sub(
     with write_txn(conn):
         conn.execute(
             """
-            INSERT OR IGNORE INTO kanban_notify_subs
+            INSERT INTO kanban_notify_subs
                 (task_id, platform, chat_id, thread_id, user_id,
                  notification_mode, origin_session_id, origin_profile,
                  origin_context, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id, platform, chat_id, thread_id) DO UPDATE SET
+                notification_mode = excluded.notification_mode,
+                user_id = COALESCE(excluded.user_id, user_id),
+                origin_session_id = COALESCE(excluded.origin_session_id, origin_session_id),
+                origin_profile = COALESCE(excluded.origin_profile, origin_profile),
+                origin_context = COALESCE(excluded.origin_context, origin_context)
             """,
             (
                 task_id, platform, chat_id, thread_id or "", user_id,

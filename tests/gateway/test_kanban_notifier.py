@@ -1,8 +1,11 @@
+import asyncio
 import pytest
 from types import SimpleNamespace
 
+from gateway.config import Platform
 from gateway.platforms.base import SendResult
 from gateway.run import GatewayRunner
+from gateway.session import SessionSource
 
 
 class _Adapter:
@@ -151,6 +154,82 @@ async def test_kanban_notification_success_mirrors_into_origin_session(monkeypat
         "thread_id": "7",
         "user_id": "u1",
     }]
+
+
+@pytest.mark.asyncio
+async def test_kanban_synthesis_waits_for_active_origin_session_lock(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    runner._conversation_locks = {}
+    adapter = _Adapter(SendResult(success=True, message_id="m1"))
+    sub = {
+        "task_id": "t_wait",
+        "platform": "telegram",
+        "chat_id": "123",
+        "thread_id": "7",
+        "user_id": "u1",
+        "notification_mode": "synthesize",
+    }
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        user_id="u1",
+        thread_id="7",
+    )
+    lock = runner._conversation_lock_for_source(source)
+    await lock.acquire()
+    synth_started = asyncio.Event()
+
+    async def fake_synthesize(**kwargs):
+        synth_started.set()
+        return "synth after native"
+
+    monkeypatch.setattr(runner, "_synthesize_kanban_notification", fake_synthesize)
+    monkeypatch.setattr("gateway.mirror.mirror_to_session", lambda *a, **k: True)
+
+    task = asyncio.create_task(
+        runner._send_kanban_notification(
+            adapter,
+            sub,
+            "direct fallback",
+            {"thread_id": "7"},
+            event=SimpleNamespace(kind="completed"),
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert adapter.calls == []
+    assert not synth_started.is_set()
+
+    lock.release()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert adapter.calls == [("123", "synth after native", {"thread_id": "7"})]
+
+
+@pytest.mark.asyncio
+async def test_kanban_notification_does_not_block_unrelated_chats(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    runner._conversation_locks = {}
+    blocked_adapter = _Adapter(SendResult(success=True, message_id="blocked"))
+    free_adapter = _Adapter(SendResult(success=True, message_id="free"))
+    blocked_sub = {"task_id": "t_blocked", "platform": "telegram", "chat_id": "123", "user_id": "u1"}
+    free_sub = {"task_id": "t_free", "platform": "telegram", "chat_id": "456", "user_id": "u2"}
+    blocked_source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1")
+    lock = runner._conversation_lock_for_source(blocked_source)
+    await lock.acquire()
+    monkeypatch.setattr("gateway.mirror.mirror_to_session", lambda *a, **k: True)
+
+    blocked_task = asyncio.create_task(
+        runner._send_kanban_notification(blocked_adapter, blocked_sub, "blocked", {})
+    )
+    await asyncio.sleep(0)
+    await runner._send_kanban_notification(free_adapter, free_sub, "free", {})
+
+    assert blocked_adapter.calls == []
+    assert free_adapter.calls == [("456", "free", {})]
+
+    lock.release()
+    await asyncio.wait_for(blocked_task, timeout=1)
 
 
 def test_kanban_notifier_defaults_to_dispatch_owner(monkeypatch):

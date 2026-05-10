@@ -795,6 +795,49 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     assert d.get("ok") is True and d.get("task_id") == tid
 
 
+def test_notify_subscription_duplicate_updates_mode_and_preserves_context(worker_env):
+    """Duplicate origin subscriptions should honor the latest delivery mode.
+
+    A manual/direct subscription can be upgraded by a later model-created task
+    request for synthesized delivery without losing non-null provenance fields.
+    """
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="telegram",
+            chat_id="chat-456",
+            thread_id="thread-789",
+            user_id="user-1",
+            notification_mode="direct",
+            origin_session_id="origin-session",
+            origin_profile="default",
+            origin_context="original user asked for a public reply",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=worker_env,
+            platform="telegram",
+            chat_id="chat-456",
+            thread_id="thread-789",
+            user_id=None,
+            notification_mode="synthesize",
+            origin_session_id=None,
+            origin_profile=None,
+            origin_context=None,
+        )
+        subs = kb.list_notify_subs(conn, worker_env)
+
+    assert len(subs) == 1
+    assert subs[0]["notification_mode"] == "synthesize"
+    assert subs[0]["user_id"] == "user-1"
+    assert subs[0]["origin_session_id"] == "origin-session"
+    assert subs[0]["origin_profile"] == "default"
+    assert subs[0]["origin_context"] == "original user asked for a public reply"
+
+
 def test_create_worker_root_task_inherits_current_origin_subscription(worker_env):
     """Parentless worker-created follow-up tasks keep the interactive origin."""
     from hermes_cli import kanban_db as kb

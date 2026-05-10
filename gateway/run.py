@@ -1207,6 +1207,13 @@ class GatewayRunner:
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+        # Per-origin conversation locks serialize every transcript-mutating
+        # conversation event for a chat/session. Native platform turns already
+        # have adapter-level active-session guards; this lock extends the same
+        # ordering to out-of-band events such as Kanban completion synthesis so
+        # they cannot run_conversation()/mirror into the same session in
+        # parallel with a user turn.
+        self._conversation_locks: Dict[str, asyncio.Lock] = {}
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
         # Overflow buffer for explicit /queue commands.  The adapter-level
         # _pending_messages dict is a single slot per session (designed for
@@ -1992,6 +1999,27 @@ class GatewayRunner:
         # to be lost during restart — queue them for the newly-spawned gateway
         # process to pick up.  "interrupt" mode drops them (current behaviour).
         return self._restart_requested and self._busy_input_mode in ("queue", "steer")
+
+    def _conversation_lock_for_key(self, session_key: str) -> asyncio.Lock:
+        """Return the per-session conversation serialization lock.
+
+        Native user turns, queued follow-ups, and synthetic completion replies
+        all acquire this lock before mutating session history or mirroring an
+        assistant message. Locks are per session key, so unrelated chats keep
+        running concurrently.
+        """
+        locks = getattr(self, "_conversation_locks", None)
+        if locks is None:
+            locks = {}
+            self._conversation_locks = locks
+        lock = locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[session_key] = lock
+        return lock
+
+    def _conversation_lock_for_source(self, source: "SessionSource") -> asyncio.Lock:
+        return self._conversation_lock_for_key(self._session_key_for_source(source))
 
     # -------- /queue FIFO helpers --------------------------------------
     # /queue must produce one full agent turn per invocation, in FIFO
@@ -4134,47 +4162,69 @@ class GatewayRunner:
             )
             return
         send_msg = msg
-        if mode == "synthesize" and getattr(event, "kind", None) == "completed":
+
+        async def _send_and_mirror() -> None:
+            nonlocal send_msg
+            if mode == "synthesize" and getattr(event, "kind", None) == "completed":
+                try:
+                    synthesized = await self._synthesize_kanban_notification(
+                        sub=sub,
+                        event=event,
+                        task=task,
+                        board=board,
+                        direct_message=msg,
+                    )
+                    if synthesized and str(synthesized).strip():
+                        send_msg = str(synthesized).strip()
+                except Exception as exc:
+                    logger.warning(
+                        "kanban notifier: synthesis failed for %s; falling back direct: %s",
+                        sub["task_id"], exc,
+                    )
+                    send_msg = msg
+            result = await adapter.send(sub["chat_id"], send_msg, metadata=metadata)
+            if getattr(result, "success", True) is False:
+                error = getattr(result, "error", None) or "adapter returned success=False"
+                raise RuntimeError(str(error))
+
             try:
-                synthesized = await self._synthesize_kanban_notification(
-                    sub=sub,
-                    event=event,
-                    task=task,
-                    board=board,
-                    direct_message=msg,
+                from gateway.mirror import mirror_to_session
+
+                mirrored = mirror_to_session(
+                    str(sub.get("platform") or ""),
+                    str(sub.get("chat_id") or ""),
+                    send_msg,
+                    source_label="kanban",
+                    thread_id=(str(sub.get("thread_id") or "") or None),
+                    user_id=(str(sub.get("user_id") or "") or None),
                 )
-                if synthesized and str(synthesized).strip():
-                    send_msg = str(synthesized).strip()
-            except Exception as exc:
-                logger.warning(
-                    "kanban notifier: synthesis failed for %s; falling back direct: %s",
-                    sub["task_id"], exc,
-                )
-                send_msg = msg
-        result = await adapter.send(sub["chat_id"], send_msg, metadata=metadata)
-        if getattr(result, "success", True) is False:
-            error = getattr(result, "error", None) or "adapter returned success=False"
-            raise RuntimeError(str(error))
+            except Exception:
+                mirrored = False
+
+            logger.info(
+                "kanban notifier: sent %s event to %s:%s message_id=%s mirrored=%s",
+                sub["task_id"], sub["platform"], sub["chat_id"],
+                getattr(result, "message_id", None), mirrored,
+            )
 
         try:
-            from gateway.mirror import mirror_to_session
-
-            mirrored = mirror_to_session(
-                str(sub.get("platform") or ""),
-                str(sub.get("chat_id") or ""),
-                send_msg,
-                source_label="kanban",
-                thread_id=(str(sub.get("thread_id") or "") or None),
-                user_id=(str(sub.get("user_id") or "") or None),
+            platform_str = str(sub.get("platform") or "telegram").lower()
+            platform = Platform(platform_str)
+            source = SessionSource(
+                platform=platform,
+                chat_id=str(sub.get("chat_id") or ""),
+                user_id=str(sub.get("user_id") or "") or None,
+                thread_id=str(sub.get("thread_id") or "") or None,
             )
+            lock = self._conversation_lock_for_source(source)
         except Exception:
-            mirrored = False
+            lock = None
 
-        logger.info(
-            "kanban notifier: sent %s event to %s:%s message_id=%s mirrored=%s",
-            sub["task_id"], sub["platform"], sub["chat_id"],
-            getattr(result, "message_id", None), mirrored,
-        )
+        if lock is None:
+            await _send_and_mirror()
+        else:
+            async with lock:
+                await _send_and_mirror()
 
     @staticmethod
     def _build_kanban_synthesis_prompt(
@@ -6425,61 +6475,63 @@ class GatewayRunner:
                 return self._telegram_topic_root_lobby_message()
             return None
 
-        # ── Claim this session before any await ───────────────────────
-        # Between here and _run_agent registering the real AIAgent, there
-        # are numerous await points (hooks, vision enrichment, STT,
-        # session hygiene compression).  Without this sentinel a second
-        # message arriving during any of those yields would pass the
-        # "already running" guard and spin up a duplicate agent for the
-        # same session — corrupting the transcript.
-        self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
-        self._running_agents_ts[_quick_key] = time.time()
-        _run_generation = self._begin_session_run_generation(_quick_key)
+        conversation_lock = self._conversation_lock_for_key(_quick_key)
+        async with conversation_lock:
+            # ── Claim this session before any await ───────────────────────
+            # Between here and _run_agent registering the real AIAgent, there
+            # are numerous await points (hooks, vision enrichment, STT,
+            # session hygiene compression).  Without this sentinel a second
+            # message arriving during any of those yields would pass the
+            # "already running" guard and spin up a duplicate agent for the
+            # same session — corrupting the transcript.
+            self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
+            self._running_agents_ts[_quick_key] = time.time()
+            _run_generation = self._begin_session_run_generation(_quick_key)
 
-        try:
-            _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
-            # Goal continuation: after the agent returns a final response
-            # for this turn, check any standing /goal — the judge will
-            # either mark it done, pause it (budget), or enqueue a
-            # continuation prompt back through the adapter FIFO so the
-            # next turn makes more progress. Wrapped in try/except so a
-            # broken judge never breaks normal message handling.
             try:
-                _final_text = ""
-                if isinstance(_agent_result, dict):
-                    _final_text = str(_agent_result.get("final_response") or "")
-                elif isinstance(_agent_result, str):
-                    _final_text = _agent_result
-                # Skip for empty responses (interrupted / errored) — the
-                # judge would almost always say "continue" and we'd loop
-                # on error. Let the user drive the next turn.
-                if _final_text.strip():
-                    try:
-                        session_entry = self.session_store.get_or_create_session(source)
-                    except Exception:
-                        session_entry = None
-                    if session_entry is not None:
-                        await self._post_turn_goal_continuation(
-                            session_entry=session_entry,
-                            source=source,
-                            final_response=_final_text,
-                        )
-            except Exception as _goal_exc:
-                logger.debug("goal continuation hook failed: %s", _goal_exc)
-            return _agent_result
-        finally:
-            # If _run_agent replaced the sentinel with a real agent and
-            # then cleaned it up, this is a no-op.  If we exited early
-            # (exception, command fallthrough, etc.) the sentinel must
-            # not linger or the session would be permanently locked out.
-            if self._running_agents.get(_quick_key) is _AGENT_PENDING_SENTINEL:
-                self._release_running_agent_state(_quick_key)
-            else:
-                # Agent path already cleaned _running_agents; make sure
-                # the paired metadata dicts are gone too.
-                self._running_agents_ts.pop(_quick_key, None)
-                if hasattr(self, "_busy_ack_ts"):
-                    self._busy_ack_ts.pop(_quick_key, None)
+                _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+                # Goal continuation: after the agent returns a final response
+                # for this turn, check any standing /goal — the judge will
+                # either mark it done, pause it (budget), or enqueue a
+                # continuation prompt back through the adapter FIFO so the
+                # next turn makes more progress. Wrapped in try/except so a
+                # broken judge never breaks normal message handling.
+                try:
+                    _final_text = ""
+                    if isinstance(_agent_result, dict):
+                        _final_text = str(_agent_result.get("final_response") or "")
+                    elif isinstance(_agent_result, str):
+                        _final_text = _agent_result
+                    # Skip for empty responses (interrupted / errored) — the
+                    # judge would almost always say "continue" and we'd loop
+                    # on error. Let the user drive the next turn.
+                    if _final_text.strip():
+                        try:
+                            session_entry = self.session_store.get_or_create_session(source)
+                        except Exception:
+                            session_entry = None
+                        if session_entry is not None:
+                            await self._post_turn_goal_continuation(
+                                session_entry=session_entry,
+                                source=source,
+                                final_response=_final_text,
+                            )
+                except Exception as _goal_exc:
+                    logger.debug("goal continuation hook failed: %s", _goal_exc)
+                return _agent_result
+            finally:
+                # If _run_agent replaced the sentinel with a real agent and
+                # then cleaned it up, this is a no-op.  If we exited early
+                # (exception, command fallthrough, etc.) the sentinel must
+                # not linger or the session would be permanently locked out.
+                if self._running_agents.get(_quick_key) is _AGENT_PENDING_SENTINEL:
+                    self._release_running_agent_state(_quick_key)
+                else:
+                    # Agent path already cleaned _running_agents; make sure
+                    # the paired metadata dicts are gone too.
+                    self._running_agents_ts.pop(_quick_key, None)
+                    if hasattr(self, "_busy_ack_ts"):
+                        self._busy_ack_ts.pop(_quick_key, None)
 
     async def _prepare_inbound_message_text(
         self,

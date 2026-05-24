@@ -695,6 +695,14 @@ schema footprint is zero outside worker processes.
 - **Isolation:** board is the hard boundary (workers get
   `HERMES_KANBAN_BOARD` pinned in env); tenant is a soft namespace
   within a board for workspace-path + memory-key isolation.
+- **Break-glass routing:** normal work should still go through Kanban. If
+  Kanban/tool runtime itself is suspected broken (for example
+  `handle_function_call` rejects `request_id`, forced skills fail at spawn,
+  protocol violations, or stale worker loops), switch to the local deterministic
+  runner instead of ad hoc Codex: `hermes break-glass diagnose`,
+  `hermes break-glass smoke`, then `hermes break-glass repair --json`. Use
+  `--restart-gateway` or `--worker-smoke` only when explicitly appropriate;
+  destructive/security-sensitive changes still require user approval.
 
 User docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban
 

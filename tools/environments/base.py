@@ -52,19 +52,68 @@ def _get_activity_callback() -> Callable[[str], None] | None:
     return getattr(_activity_callback_local, "callback", None)
 
 
+def _auto_kanban_heartbeat_if_due(state: dict, label: str, now: float) -> None:
+    """Best-effort Kanban heartbeat for long blocking tool operations.
+
+    This runs below the LLM/tool layer, so foreground terminal commands that
+    block the worker for minutes still extend the Kanban claim and leave
+    heartbeat events.  It intentionally avoids the public tool registry to
+    prevent recursive tool calls.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id:
+        return
+    heartbeat_after = float(state.get("kanban_heartbeat_after", 60.0))
+    heartbeat_interval = float(state.get("kanban_heartbeat_interval", 60.0))
+    if now - state["start"] < heartbeat_after:
+        return
+    last = state.get("last_kanban_heartbeat", state["start"])
+    if now - last < heartbeat_interval:
+        return
+    state["last_kanban_heartbeat"] = now
+    try:
+        from agent.redact import redact_sensitive_text
+        from hermes_cli import kanban_db as kb
+
+        safe_label = redact_sensitive_text(str(label or "operation running"), force=True)
+        note = f"{safe_label} ({int(now - state['start'])}s elapsed)"
+        claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+        run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+        expected_run_id = int(run_id_raw) if run_id_raw else None
+        conn = kb.connect()
+        try:
+            # Preserve the stricter claim-lock extension when dispatcher env is
+            # available, then record the worker heartbeat on the current run.
+            if claim_lock:
+                kb.heartbeat_claim(conn, task_id, claimer=claim_lock)
+            kb.heartbeat_worker(
+                conn,
+                task_id,
+                note=note,
+                expected_run_id=expected_run_id,
+            )
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("auto kanban heartbeat failed", exc_info=True)
+
+
 def touch_activity_if_due(
     state: dict,
     label: str,
 ) -> None:
-    """Fire the activity callback at most once every ``state['interval']`` seconds.
+    """Fire activity + Kanban heartbeats while a blocking operation runs.
 
     *state* must contain ``last_touch`` (monotonic timestamp) and ``start``
-    (monotonic timestamp of the operation start).  An optional ``interval``
-    key overrides the default 10 s cadence.
+    (monotonic timestamp of the operation start).  Optional keys:
+    ``interval`` for activity callback cadence (default 10s),
+    ``kanban_heartbeat_after`` (default 60s), and
+    ``kanban_heartbeat_interval`` (default 60s).
 
     Swallows all exceptions so callers don't need their own try/except.
     """
     now = time.monotonic()
+    _auto_kanban_heartbeat_if_due(state, label, now)
     interval = state.get("interval", 10.0)
     if now - state["last_touch"] < interval:
         return
@@ -443,7 +492,13 @@ class BaseEnvironment(ABC):
     # Process lifecycle
     # ------------------------------------------------------------------
 
-    def _wait_for_process(self, proc: ProcessHandle, timeout: int = 120) -> dict:
+    def _wait_for_process(
+        self,
+        proc: ProcessHandle,
+        timeout: int = 120,
+        *,
+        activity_label: str = "terminal command running",
+    ) -> dict:
         """Poll-based wait with interrupt checking and stdout draining.
 
         Shared across all backends — not overridden.
@@ -604,8 +659,9 @@ class BaseEnvironment(ABC):
                         else timeout_msg.lstrip(),
                         "returncode": 124,
                     }
-                # Periodic activity touch so the gateway knows we're alive
-                touch_activity_if_due(_activity_state, "terminal command running")
+                # Periodic activity touch so the gateway knows we're alive.
+                # The label is also used for internal Kanban heartbeat notes.
+                touch_activity_if_due(_activity_state, activity_label)
 
                 # Heartbeat every ~30s: proves the loop is alive and reports
                 # the activity-callback state (thread-local, can get clobbered
@@ -779,7 +835,18 @@ class BaseEnvironment(ABC):
         proc = self._run_bash(
             wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin
         )
-        result = self._wait_for_process(proc, timeout=effective_timeout)
+        _cmd_preview = " ".join(str(command or "").split())
+        if len(_cmd_preview) > 80:
+            _cmd_preview = _cmd_preview[:77] + "..."
+        if any(tok in (command or "").lower() for tok in ("pytest", " test", " npm test", " uv test")):
+            _activity_label = f"test command running: {_cmd_preview}" if _cmd_preview else "test command running"
+        else:
+            _activity_label = f"terminal command running: {_cmd_preview}" if _cmd_preview else "terminal command running"
+        result = self._wait_for_process(
+            proc,
+            timeout=effective_timeout,
+            activity_label=_activity_label,
+        )
         self._update_cwd(result)
 
         return result

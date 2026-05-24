@@ -444,6 +444,12 @@ class GatewayConfig:
     # fresh session exactly as if the reset policy had fired.  0 = disabled.
     session_store_max_age_days: int = 90
 
+    # Locale for gateway-generated, non-model system messages such as
+    # restart/shutdown lifecycle notifications. Empty/"en" preserves the
+    # historical English strings. Platform extra.system_message_locale can
+    # override this for end-user channels without changing agent replies.
+    system_message_locale: str = "en"
+
     def get_connected_platforms(self) -> List[Platform]:
         """Return list of platforms that are enabled and configured."""
         connected = []
@@ -537,6 +543,7 @@ class GatewayConfig:
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
+            "system_message_locale": self.system_message_locale,
         }
     
     @classmethod
@@ -606,6 +613,7 @@ class GatewayConfig:
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
+            system_message_locale=str(data.get("system_message_locale") or "en"),
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
@@ -629,6 +637,18 @@ class GatewayConfig:
                     "public",
                 )
         return "public"
+
+    def get_system_message_locale(self, platform: Optional[Platform] = None) -> str:
+        """Return locale for gateway-generated non-model messages."""
+        locale: Any = self.system_message_locale
+        if platform:
+            platform_cfg = self.platforms.get(platform)
+            if platform_cfg and "system_message_locale" in platform_cfg.extra:
+                locale = platform_cfg.extra.get("system_message_locale")
+        value = str(locale or "en").strip().lower().replace("_", "-")
+        if value in {"zh", "zh-cn", "zh-hans", "cn", "chinese", "simplified-chinese"}:
+            return "zh-CN"
+        return "en"
 
 
 def load_gateway_config() -> GatewayConfig:
@@ -709,6 +729,12 @@ def load_gateway_config() -> GatewayConfig:
                     "pair",
                 )
 
+            gateway_section = yaml_cfg.get("gateway")
+            if isinstance(gateway_section, dict) and "system_message_locale" in gateway_section:
+                gw_data["system_message_locale"] = gateway_section.get("system_message_locale")
+            if "system_message_locale" in yaml_cfg:
+                gw_data["system_message_locale"] = yaml_cfg.get("system_message_locale")
+
             # Merge platforms section from config.yaml into gw_data so that
             # nested keys like platforms.webhook.extra.routes are loaded.
             yaml_platforms = yaml_cfg.get("platforms")
@@ -750,6 +776,8 @@ def load_gateway_config() -> GatewayConfig:
                         platform_cfg.get("notice_delivery"),
                         "public",
                     )
+                if "system_message_locale" in platform_cfg:
+                    bridged["system_message_locale"] = platform_cfg["system_message_locale"]
                 if "reply_prefix" in platform_cfg:
                     bridged["reply_prefix"] = platform_cfg["reply_prefix"]
                 if "reply_in_thread" in platform_cfg:

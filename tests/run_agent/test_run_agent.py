@@ -991,6 +991,41 @@ class TestBuildSystemPrompt:
         assert mock_skills.call_args.kwargs["available_tools"] == set(toolset_map)
         assert mock_skills.call_args.kwargs["available_toolsets"] == {"web", "skills"}
 
+    def test_agentfeeds_system_manifest_is_inserted_before_skills_when_enabled(self):
+        tools = _make_tool_defs("skills_list", "skill_view", "skill_manage")
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("hermes_cli.config.load_config", return_value={"agentfeeds": {"system_prompt": {"enabled": True}}}),
+            patch("run_agent._build_agentfeeds_system_manifest", return_value="<agentfeeds>\n- weather: santa-clara-current\n</agentfeeds>"),
+            patch("run_agent.build_skills_system_prompt", return_value="SKILLS_PROMPT"),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            prompt = agent._build_system_prompt()
+
+        assert "<agentfeeds>" in prompt
+        assert prompt.index("<agentfeeds>") < prompt.index("SKILLS_PROMPT")
+
+    def test_agentfeeds_manifest_renderer_groups_and_caps_without_volatile_fields(self):
+        manifest = run_agent._render_agentfeeds_manifest(
+            ["weather/santa-clara-current", "finance/quote-msft", "finance/quote-btc", "finance/quote-spy"],
+            max_per_group=2,
+        )
+
+        assert manifest is not None
+        assert "- weather: santa-clara-current" in manifest
+        assert "- finance: quote-msft, quote-btc, ... (+1 more)" in manifest
+        assert "stale" not in manifest.lower()
+        assert "updated" not in manifest.lower()
+        assert "health" not in manifest.lower()
+
 
 class TestToolUseEnforcementConfig:
     """Tests for the agent.tool_use_enforcement config option."""
@@ -2052,6 +2087,12 @@ class TestConcurrentToolExecution:
                 "web_search", {"q": "test"}, "task-1",
                 tool_call_id=None,
                 session_id=agent.session_id,
+                platform="",
+                chat_id="",
+                thread_id="",
+                user_id="",
+                request_id="",
+                user_task="",
                 enabled_tools=list(agent.valid_tool_names),
                 skip_pre_tool_call_hook=True,
             )

@@ -9274,6 +9274,13 @@ def main():
     kanban_parser.set_defaults(func=cmd_kanban)
 
     # =========================================================================
+    # break-glass command — local self-repair for tool-runtime/Kanban failures
+    # =========================================================================
+    from hermes_cli.break_glass import build_parser as _build_break_glass_parser
+
+    _build_break_glass_parser(subparsers)
+
+    # =========================================================================
     # hooks command — shell-hook inspection and management
     # =========================================================================
     hooks_parser = subparsers.add_parser(

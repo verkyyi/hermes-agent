@@ -6818,6 +6818,8 @@ class HermesCLI:
             self._manual_compress(cmd_original)
         elif canonical == "usage":
             self._show_usage()
+        elif canonical == "metrics":
+            self._show_metrics(cmd_original)
         elif canonical == "insights":
             self._show_insights(cmd_original)
         elif canonical == "copy":
@@ -8077,6 +8079,23 @@ class HermesCLI:
             logging.getLogger().setLevel(logging.INFO)
             for quiet_logger in ('tools', 'run_agent', 'trajectory_compressor', 'cron', 'hermes_cli'):
                 logging.getLogger(quiet_logger).setLevel(logging.ERROR)
+
+    def _show_metrics(self, command: str = "/metrics"):
+        """Show local latency telemetry summary."""
+        hours = 24.0
+        parts = command.split(maxsplit=1)
+        if len(parts) > 1:
+            raw = parts[1].strip().split()[0]
+            try:
+                hours = max(0.1, float(raw))
+            except Exception:
+                self._console_print("Usage: /metrics [hours]")
+                return
+        try:
+            from agent.telemetry import format_metrics_summary
+            self._console_print(format_metrics_summary(window_hours=hours))
+        except Exception as exc:
+            self._console_print(f"Telemetry metrics unavailable: {exc}")
 
     def _show_insights(self, command: str = "/insights"):
         """Show usage insights and analytics from session history."""

@@ -944,7 +944,23 @@ def skill_view(
             all_dirs.append(SKILLS_DIR)
         all_dirs.extend(get_external_skills_dirs())
 
-        if not all_dirs:
+        # Explicit absolute skill paths are orchestration/user intent and should
+        # be loadable even when the active profile has no local skills/ dir. This
+        # is what Kanban uses after resolving a forced skill from the default
+        # profile for a lean worker profile.
+        explicit_path = Path(name).expanduser()
+        explicit_skill_dir = None
+        explicit_skill_md = None
+        if explicit_path.is_absolute():
+            if explicit_path.is_dir() and (explicit_path / "SKILL.md").exists():
+                explicit_skill_dir = explicit_path
+                explicit_skill_md = explicit_path / "SKILL.md"
+            elif explicit_path.is_file():
+                explicit_skill_md = explicit_path
+                if explicit_path.name == "SKILL.md":
+                    explicit_skill_dir = explicit_path.parent
+
+        if not all_dirs and explicit_skill_md is None:
             return json.dumps(
                 {
                     "success": False,
@@ -953,11 +969,13 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        skill_dir = None
-        skill_md = None
+        skill_dir = explicit_skill_dir
+        skill_md = explicit_skill_md
 
         # Search all dirs: local first, then external (first match wins)
         for search_dir in all_dirs:
+            if skill_md:
+                break
             # Try direct path first (e.g., "mlops/axolotl")
             direct_path = search_dir / name
             if direct_path.is_dir() and (direct_path / "SKILL.md").exists():

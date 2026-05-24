@@ -8,15 +8,37 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 import json
 import logging
 import os
 import tempfile
 import html as _html
+from pathlib import Path as _Path
 import re
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
+
+
+def _telegram_location_iso(dt: datetime) -> str:
+    return dt.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _telegram_atomic_write_json(path: _Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
 
 try:
     from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
@@ -305,6 +327,60 @@ class TelegramAdapter(BasePlatformAdapter):
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
+
+    def _persist_latest_location(
+        self,
+        *,
+        lat: float,
+        lon: float,
+        accuracy_m: Optional[float],
+        source: str,
+        live_period: Optional[int] = None,
+    ) -> None:
+        """Persist only the latest authorized Telegram location for AgentFeeds."""
+        ttl_seconds = int(os.getenv("HERMES_LATEST_LOCATION_TTL_SECONDS", "3600"))
+        now = datetime.now(UTC)
+        latest = {
+            "schema_version": 1,
+            "kind": "latest_location",
+            "source": source,
+            "updated_at": _telegram_location_iso(now),
+            "observed_at": _telegram_location_iso(now),
+            "expires_at": _telegram_location_iso(now + timedelta(seconds=ttl_seconds)),
+            "ttl_seconds": ttl_seconds,
+            "is_fresh": True,
+            "location": {
+                "lat": round(float(lat), 7),
+                "lon": round(float(lon), 7),
+            },
+            "privacy": {
+                "retention": "latest_only_no_history",
+                "history_retained": False,
+            },
+        }
+        if accuracy_m is not None:
+            latest["location"]["accuracy_m"] = round(float(accuracy_m), 2)
+        if live_period is not None:
+            latest["telegram_live_period_seconds"] = int(live_period)
+
+        agentfeeds_payload = {
+            "_meta": {
+                "subscription_id": "personal/verky-location",
+                "title": "Verky latest shared location",
+                "type": "personal_location_latest",
+                "updated_at": latest["updated_at"],
+                "fetched_at": latest["updated_at"],
+                "stale": False,
+            },
+            "data": latest,
+        }
+        latest_path = _Path(os.getenv("HERMES_LATEST_LOCATION_PATH", "/Users/verkyyi/.hermes/state/latest_location.json")).expanduser()
+        agentfeeds_path = _Path(os.getenv("HERMES_LATEST_LOCATION_AGENTFEEDS_PATH", "/Users/verkyyi/.agentfeeds/state/personal/verky-location.json")).expanduser()
+        try:
+            _telegram_atomic_write_json(latest_path, latest)
+            _telegram_atomic_write_json(agentfeeds_path, agentfeeds_payload)
+        except Exception as exc:
+            logger.warning("[%s] Failed to persist latest Telegram location: %s", self.name, exc)
 
     def _is_callback_user_authorized(
         self,
@@ -3026,7 +3102,21 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         # Build a text message with coordinates and context
-        parts = ["[The user shared a location pin.]"]
+        live_period = getattr(location, "live_period", None)
+        horizontal_accuracy = getattr(location, "horizontal_accuracy", None)
+        self._persist_latest_location(
+            lat=float(lat),
+            lon=float(lon),
+            accuracy_m=float(horizontal_accuracy) if horizontal_accuracy is not None else None,
+            source="telegram_live_location" if live_period else "telegram_location",
+            live_period=int(live_period) if live_period is not None else None,
+        )
+
+        parts = ["[The user shared a live location update.]" if live_period else "[The user shared a location pin.]"]
+        if live_period:
+            parts.append(f"Telegram live_period_seconds: {live_period}")
+        if horizontal_accuracy is not None:
+            parts.append(f"accuracy_m: {horizontal_accuracy}")
         if venue:
             title = getattr(venue, "title", None)
             address = getattr(venue, "address", None)

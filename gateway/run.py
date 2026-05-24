@@ -26,6 +26,7 @@ import signal
 import tempfile
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -51,6 +52,264 @@ _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+
+
+_TELEGRAM_PRE_LLM_ACK_LONG_VERBS = frozenset({
+    "run", "check", "verify", "debug", "fix", "implement", "create",
+    "search", "research", "analyze", "analyse", "inspect", "investigate",
+    "test", "restart", "deploy", "configure", "setup", "install", "update",
+    "review", "summarize", "compare", "find", "look", "work", "resolve",
+})
+_TELEGRAM_PRE_LLM_ACK_LONG_TOPICS = frozenset({
+    "hermes", "gateway", "kanban", "cron", "metrics", "telemetry", "config",
+    "profile", "worker", "workers", "agent", "agents", "tool", "tools",
+    "file", "files", "code", "repo", "repository", "git", "github", "pr",
+    "issue", "issues", "test", "tests", "system", "server", "process",
+    "logs", "database", "sqlite", "web", "browser", "search", "research",
+    "analyze", "analysis", "debug", "bug", "fix", "implement",
+})
+_PRE_LLM_ACK_TRIVIAL = frozenset({
+    "ok", "okay", "k", "yes", "no", "y", "n", "thanks", "thank you",
+    "thx", "hi", "hello", "hey", "yo", "cool", "nice", "done", "收到",
+    "好的", "好", "嗯", "是", "不是", "谢谢", "謝謝",
+})
+
+# Backwards-compatible alias for older tests/imports while the heuristic is now
+# intentionally shared by Telegram and Verky's main/default Weixin gateway.
+_TELEGRAM_PRE_LLM_ACK_TRIVIAL = _PRE_LLM_ACK_TRIVIAL
+_PRE_LLM_ACK_PLATFORMS = {"telegram", "weixin"}
+
+
+def _normalize_ack_text_for_heuristic(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _should_send_pre_llm_ack(text: str, *, is_command: bool = False) -> tuple[bool, str]:
+    """Conservative Phase-1 heuristic for pre-LLM acknowledgements.
+
+    The goal is to acknowledge likely long/delegated work before model latency,
+    while staying quiet for short casual turns and slash/direct commands that
+    are handled instantly by the gateway.  The text heuristic is platform-neutral;
+    platform/chat eligibility is checked separately so Weixin groups do not get
+    optimistic acks unless the platform has already modeled explicit addressing.
+    """
+    normalized = _normalize_ack_text_for_heuristic(text)
+    if is_command or normalized.startswith("/"):
+        return False, "command"
+    if not normalized:
+        return False, "empty"
+    if normalized in _PRE_LLM_ACK_TRIVIAL:
+        return False, "trivial_exact"
+    words = re.findall(r"[a-z0-9_\-]+", normalized)
+    if len(normalized) <= 18 and len(words) <= 4:
+        return False, "short"
+    word_set = set(words)
+    verb_hit = sorted(word_set & _TELEGRAM_PRE_LLM_ACK_LONG_VERBS)
+    topic_hit = sorted(word_set & _TELEGRAM_PRE_LLM_ACK_LONG_TOPICS)
+    # Obvious multi-step punctuation/phrasing is a useful signal, but only when
+    # paired with a long-work verb/topic to avoid acknowledging casual essays.
+    has_multistep_signal = bool(
+        " then " in normalized
+        or " and then " in normalized
+        or ";" in normalized
+        or "step" in normalized
+        or "multi-step" in normalized
+        or "multiple" in normalized
+    )
+    if verb_hit and (topic_hit or has_multistep_signal or len(normalized) >= 45):
+        return True, f"verb:{verb_hit[0]}"
+    if topic_hit and len(normalized) >= 60:
+        return True, f"topic:{topic_hit[0]}"
+    return False, "no_long_signal"
+
+
+def _should_send_telegram_pre_llm_ack(text: str, *, is_command: bool = False) -> tuple[bool, str]:
+    """Compatibility wrapper for the shared Telegram/Weixin text heuristic."""
+    return _should_send_pre_llm_ack(text, is_command=is_command)
+
+
+_PUBLIC_LONG_PROGRESS_PLATFORMS = {"telegram", "weixin"}
+_PUBLIC_LONG_PROGRESS_DEFAULT_INITIAL_DELAY_S = 90.0
+_PUBLIC_LONG_PROGRESS_MIN_INTERVAL_S = 120.0
+_PUBLIC_LONG_PROGRESS_LONG_SILENCE_S = 300.0
+
+
+def _platform_name(value: Any) -> str:
+    return str(getattr(value, "value", value) or "").lower()
+
+
+def _is_hermes_hk_runtime(*, profile_name: str | None = None, hermes_home: str | None = None) -> bool:
+    """Return True for the Hermes-hk Weixin profile/surface.
+
+    Long-task public progress is intended for Verky's main Telegram/Weixin
+    surfaces only.  The hk elder-assistant profile has different UX norms, so
+    keep it out even if it also uses the ``weixin`` platform adapter.
+    """
+    haystack = " ".join(
+        part.lower()
+        for part in (profile_name, hermes_home)
+        if part
+    )
+    return "hermes-hk" in haystack or "profiles/hk" in haystack or "profiles/hermes-hk" in haystack
+
+
+def _public_progress_phase(activity: dict | None) -> str:
+    """Map internal activity/tool names to a small public-safe phase label."""
+    if not isinstance(activity, dict):
+        return "working"
+    text = " ".join(
+        str(activity.get(key) or "").lower()
+        for key in ("current_tool", "last_activity_desc")
+    )
+    if any(token in text for token in ("pytest", "test", "verification", "verify", "lint")):
+        return "verification"
+    if any(token in text for token in ("browser", "crawl", "navigate")):
+        return "browser"
+    if any(token in text for token in ("web_search", "web_extract", "searching", "research")):
+        return "research"
+    if any(token in text for token in ("terminal", "execute_code", "command", "script")):
+        return "command"
+    if any(token in text for token in ("kanban", "delegate", "worker")):
+        return "handoff"
+    if any(token in text for token in ("read_file", "write_file", "patch", "search_files", "file")):
+        return "files"
+    return "working"
+
+
+def _public_progress_message(platform: Any, phase: str) -> str:
+    """Return a sanitized, user-visible long-task progress message."""
+    if _platform_name(platform) == "weixin":
+        messages = {
+            "verification": "还在处理，正在验证结果。",
+            "browser": "还在处理，正在浏览和核对页面。",
+            "research": "还在处理，正在查资料。",
+            "command": "还在处理，正在运行命令。",
+            "handoff": "还在处理，正在安排后续步骤。",
+            "files": "还在处理，正在检查文件。",
+            "working": "还在处理，稍后给你结果。",
+        }
+    else:
+        messages = {
+            "verification": "Still working — running verification now.",
+            "browser": "Still working — checking the page now.",
+            "research": "Still working — checking sources now.",
+            "command": "Still working — running commands now.",
+            "handoff": "Still working — coordinating the next step now.",
+            "files": "Still working — checking files now.",
+            "working": "Still working — I’ll send the result when it’s ready.",
+        }
+    return messages.get(phase, messages["working"])
+
+
+def _public_progress_interval_from_env() -> float | None:
+    """Minimum public long-progress cadence, or None when disabled."""
+    raw = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
+    return max(raw, _PUBLIC_LONG_PROGRESS_MIN_INTERVAL_S) if raw > 0 else None
+
+
+def _kanban_heartbeat_progress_message(platform: Any, event: Any) -> str | None:
+    """Map a Kanban heartbeat event to a safe public progress message.
+
+    Kanban workers run out-of-band from the foreground gateway turn, so they do
+    not have the gateway's live activity progress loop. Their durable heartbeat
+    events are the only generic liveness channel the notifier can observe.
+    """
+    if getattr(event, "kind", None) != "heartbeat":
+        return None
+    if _platform_name(platform) not in _PUBLIC_LONG_PROGRESS_PLATFORMS:
+        return None
+    if _is_hermes_hk_runtime(
+        profile_name=os.getenv("HERMES_PROFILE"),
+        hermes_home=os.getenv("HERMES_HOME"),
+    ):
+        return None
+    payload = getattr(event, "payload", None) or {}
+    note = str(payload.get("note") or "")[:240]
+    phase = _public_progress_phase({"last_activity_desc": note})
+    return _public_progress_message(platform, phase)
+
+
+_KANBAN_TERMINAL_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+_KANBAN_PROGRESS_NOTIFY_KINDS = ("heartbeat",)
+_KANBAN_NOTIFY_KINDS = _KANBAN_TERMINAL_NOTIFY_KINDS + _KANBAN_PROGRESS_NOTIFY_KINDS
+
+
+def _should_send_public_progress(
+    *,
+    platform: Any,
+    profile_name: str | None,
+    hermes_home: str | None,
+    elapsed_s: float,
+    now_s: float,
+    last_sent_s: float | None,
+    last_phase: str | None,
+    phase: str,
+    initial_delay_s: float = _PUBLIC_LONG_PROGRESS_DEFAULT_INITIAL_DELAY_S,
+    min_interval_s: float = _PUBLIC_LONG_PROGRESS_MIN_INTERVAL_S,
+    long_silence_s: float = _PUBLIC_LONG_PROGRESS_LONG_SILENCE_S,
+) -> tuple[bool, str]:
+    """Gate public long-task progress to avoid spam and internal leakage."""
+    if _platform_name(platform) not in _PUBLIC_LONG_PROGRESS_PLATFORMS:
+        return False, "unsupported_platform"
+    if _is_hermes_hk_runtime(profile_name=profile_name, hermes_home=hermes_home):
+        return False, "hermes_hk_excluded"
+    if elapsed_s < initial_delay_s:
+        return False, "too_early"
+    if last_sent_s is None:
+        return True, "first_notice"
+    since_last = now_s - last_sent_s
+    if since_last < min_interval_s:
+        return False, "rate_limited"
+    if phase != last_phase:
+        return True, "phase_changed"
+    if since_last >= long_silence_s:
+        return True, "long_silence"
+    return False, "no_change"
+
+
+def _pre_llm_ack_eligible_source(platform: Any, chat_type: str | None) -> tuple[bool, str]:
+    """Return whether a source may receive a pre-LLM ack.
+
+    Telegram keeps the existing DM-only behavior.  Weixin is enabled for main
+    default DMs only; group chats are skipped here so existing adapter-side
+    group trigger discipline stays authoritative and we never ack an unaddressed
+    group message.  If Weixin later exposes explicit mention/reply metadata in
+    MessageEvent, this helper is the narrow place to add addressed-group acks.
+    """
+    platform_name = getattr(platform, "value", platform)
+    if platform_name not in _PRE_LLM_ACK_PLATFORMS:
+        return False, "unsupported_platform"
+    if chat_type != "dm":
+        return False, "not_dm"
+    return True, "eligible_dm"
+
+
+def _record_gateway_telemetry_span(
+    name: str,
+    *,
+    platform: str = "gateway",
+    status: str = "ok",
+    error: str | None = None,
+    attributes: dict[str, Any] | None = None,
+    started_at_ms: int | None = None,
+    ended_at_ms: int | None = None,
+    duration_ms: float | int | None = None,
+) -> None:
+    """Fail-open standalone gateway telemetry span recorder."""
+    try:
+        from agent.telemetry import get_telemetry_store
+        get_telemetry_store().record_span_event(
+            name,
+            platform=platform,
+            status=status,
+            error=error,
+            attributes=attributes or {},
+            started_at_ms=started_at_ms,
+            ended_at_ms=ended_at_ms,
+            duration_ms=duration_ms,
+        )
+    except Exception:
+        logger.debug("gateway telemetry span failed: %s", name, exc_info=True)
 
 
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
@@ -710,6 +969,31 @@ _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
 
+
+def _gateway_system_message(locale: str, key: str) -> str:
+    """Return a user-visible gateway/system message in the requested locale."""
+    normalized = str(locale or "en").strip().lower().replace("_", "-")
+    zh = normalized in {"zh", "zh-cn", "zh-hans", "cn", "chinese", "simplified-chinese"}
+    if zh:
+        messages = {
+            "shutdown_restarting": "⚠️ 小慧正在重启。当前任务会先暂停。重启后您再发一句话，小慧会尽量接着处理。",
+            "shutdown_stopping": "⚠️ 小慧正在临时关闭。当前任务会先暂停。",
+            "restart_complete": "♻ 小慧已经重启好了。这个对话可以继续。",
+            "online": "♻️ 小慧已上线，可以继续使用。",
+        }
+    else:
+        messages = {
+            "shutdown_restarting": (
+                "⚠️ Gateway restarting — Your current task will be interrupted. "
+                "Send any message after restart and I'll try to resume where you left off."
+            ),
+            "shutdown_stopping": "⚠️ Gateway shutting down — Your current task will be interrupted.",
+            "restart_complete": "♻ Gateway restarted successfully. Your session continues.",
+            "online": "♻️ Gateway online — Hermes is back and ready.",
+        }
+    return messages[key]
+
+
 _CONTROL_INTERRUPT_MESSAGES = frozenset(
     {
         _INTERRUPT_REASON_STOP.lower(),
@@ -1112,6 +1396,13 @@ class GatewayRunner:
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+        # Per-origin conversation locks serialize every transcript-mutating
+        # conversation event for a chat/session. Native platform turns already
+        # have adapter-level active-session guards; this lock extends the same
+        # ordering to out-of-band events such as Kanban completion synthesis so
+        # they cannot run_conversation()/mirror into the same session in
+        # parallel with a user turn.
+        self._conversation_locks: Dict[str, asyncio.Lock] = {}
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
         # Overflow buffer for explicit /queue commands.  The adapter-level
         # _pending_messages dict is a single slot per session (designed for
@@ -1833,6 +2124,27 @@ class GatewayRunner:
         # process to pick up.  "interrupt" mode drops them (current behaviour).
         return self._restart_requested and self._busy_input_mode in ("queue", "steer")
 
+    def _conversation_lock_for_key(self, session_key: str) -> asyncio.Lock:
+        """Return the per-session conversation serialization lock.
+
+        Native user turns, queued follow-ups, and synthetic completion replies
+        all acquire this lock before mutating session history or mirroring an
+        assistant message. Locks are per session key, so unrelated chats keep
+        running concurrently.
+        """
+        locks = getattr(self, "_conversation_locks", None)
+        if locks is None:
+            locks = {}
+            self._conversation_locks = locks
+        lock = locks.get(session_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[session_key] = lock
+        return lock
+
+    def _conversation_lock_for_source(self, source: "SessionSource") -> asyncio.Lock:
+        return self._conversation_lock_for_key(self._session_key_for_source(source))
+
     # -------- /queue FIFO helpers --------------------------------------
     # /queue must produce one full agent turn per invocation, in FIFO
     # order, with no merging.  The adapter's _pending_messages dict is a
@@ -2482,15 +2794,6 @@ class GatewayRunner:
         """
         active = self._snapshot_running_agents()
 
-        action = "restarting" if self._restart_requested else "shutting down"
-        hint = (
-            "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
-            if self._restart_requested
-            else "Your current task will be interrupted."
-        )
-        msg = f"⚠️ Gateway {action} — {hint}"
-
         notified: set[tuple[str, str, Optional[str]]] = set()
         for session_key in active:
             source = None
@@ -2547,6 +2850,11 @@ class GatewayRunner:
                 # Include thread_id if present so the message lands in the
                 # correct forum topic / thread.
                 metadata = {"thread_id": thread_id} if thread_id else None
+                locale = self.config.get_system_message_locale(platform)
+                msg = _gateway_system_message(
+                    locale,
+                    "shutdown_restarting" if self._restart_requested else "shutdown_stopping",
+                )
 
                 result = await adapter.send(chat_id, msg, metadata=metadata)
                 if result is not None and getattr(result, "success", True) is False:
@@ -2593,6 +2901,11 @@ class GatewayRunner:
 
             try:
                 metadata = {"thread_id": home.thread_id} if home.thread_id else None
+                locale = self.config.get_system_message_locale(platform)
+                msg = _gateway_system_message(
+                    locale,
+                    "shutdown_restarting" if self._restart_requested else "shutdown_stopping",
+                )
                 if metadata:
                     result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
                 else:
@@ -3575,7 +3888,7 @@ class GatewayRunner:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        TERMINAL_KINDS = _KANBAN_TERMINAL_NOTIFY_KINDS
         # Terminal event kinds trigger automatic unsubscription — the task
         # is done, blocked, or in a retry-needed state that the human
         # shouldn't keep pinging a stale chat for. Previously we only
@@ -3592,6 +3905,10 @@ class GatewayRunner:
             self, "_kanban_sub_fail_counts", {}
         )
         self._kanban_sub_fail_counts = sub_fail_counts
+        progress_sent_at: dict[tuple, int] = getattr(
+            self, "_kanban_progress_sent_at", {}
+        )
+        self._kanban_progress_sent_at = progress_sent_at
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
@@ -3626,7 +3943,7 @@ class GatewayRunner:
                                     platform=sub["platform"],
                                     chat_id=sub["chat_id"],
                                     thread_id=sub.get("thread_id") or "",
-                                    kinds=TERMINAL_KINDS,
+                                    kinds=_KANBAN_NOTIFY_KINDS,
                                 )
                                 if not events:
                                     continue
@@ -3671,7 +3988,27 @@ class GatewayRunner:
                         public_mode = str(
                             sub.get("notification_mode") or "direct"
                         ).strip().lower() == "synthesize"
-                        if kind == "completed":
+                        progress_msg = None
+                        if kind == "heartbeat":
+                            progress_interval = _public_progress_interval_from_env()
+                            if progress_interval is None:
+                                continue
+                            sub_key_for_progress = (
+                                sub["task_id"], sub["platform"],
+                                sub["chat_id"], sub.get("thread_id") or "",
+                            )
+                            last_progress_at = progress_sent_at.get(sub_key_for_progress)
+                            event_created_at = int(getattr(ev, "created_at", 0) or time.time())
+                            if (
+                                last_progress_at is not None
+                                and event_created_at - last_progress_at < progress_interval
+                            ):
+                                continue
+                            progress_msg = _kanban_heartbeat_progress_message(plat, ev)
+                            if not progress_msg:
+                                continue
+                            msg = progress_msg
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -3708,15 +4045,21 @@ class GatewayRunner:
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
+                            provider_public_message = ""
+                            if ev.payload and ev.payload.get("public_message"):
+                                provider_public_message = str(ev.payload["public_message"])[:500]
                             if public_mode:
-                                msg = (
+                                msg = provider_public_message or (
                                     "I hit a backend issue and couldn’t finish this after retries. "
                                     "Ask for internal run details if you want me to inspect the failure."
                                 )
                             else:
+                                provider_suffix = ""
+                                if ev.payload and ev.payload.get("provider_failure_kind"):
+                                    provider_suffix = f" ({ev.payload['provider_failure_kind']})"
                                 msg = (
-                                    f"✖ {tag}Kanban {sub['task_id']} gave up "
-                                    f"after repeated spawn failures{err}"
+                                    f"✖ {tag}Kanban {sub['task_id']} gave up{provider_suffix} "
+                                    f"after repeated worker failures{err}"
                                 )
                         elif kind == "crashed":
                             if public_mode:
@@ -3751,6 +4094,10 @@ class GatewayRunner:
                                 adapter, sub, msg, metadata,
                                 event=ev, task=task, board=board_slug,
                             )
+                            if kind == "heartbeat":
+                                progress_sent_at[sub_key] = int(
+                                    getattr(ev, "created_at", 0) or time.time()
+                                )
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
@@ -3824,47 +4171,135 @@ class GatewayRunner:
             )
             return
         send_msg = msg
-        if mode == "synthesize" and getattr(event, "kind", None) == "completed":
+
+        def _record_gateway_span(name: str, **kwargs: Any) -> None:
             try:
-                synthesized = await self._synthesize_kanban_notification(
-                    sub=sub,
-                    event=event,
-                    task=task,
-                    board=board,
-                    direct_message=msg,
+                from agent.telemetry import record_span_event
+
+                attrs = dict(kwargs.pop("attributes", {}) or {})
+                attrs.setdefault("platform", str(sub.get("platform") or ""))
+                attrs.setdefault("notification_mode", mode)
+                attrs.setdefault("task_id", str(sub.get("task_id") or ""))
+                if sub.get("request_id"):
+                    attrs.setdefault("request_id", str(sub.get("request_id")))
+                if getattr(event, "kind", None):
+                    attrs.setdefault("event_kind", str(getattr(event, "kind")))
+                if task and getattr(task, "assignee", None):
+                    attrs.setdefault("profile", str(getattr(task, "assignee")))
+                if task and getattr(task, "status", None):
+                    attrs.setdefault("task_status", str(getattr(task, "status")))
+                record_span_event(
+                    name,
+                    platform="gateway",
+                    profile=str(getattr(task, "assignee", "") or ""),
+                    attributes=attrs,
+                    **kwargs,
                 )
-                if synthesized and str(synthesized).strip():
-                    send_msg = str(synthesized).strip()
+            except Exception:
+                pass
+
+        async def _send_and_mirror() -> None:
+            nonlocal send_msg
+            if mode == "synthesize" and getattr(event, "kind", None) == "completed":
+                try:
+                    synthesized = await self._synthesize_kanban_notification(
+                        sub=sub,
+                        event=event,
+                        task=task,
+                        board=board,
+                        direct_message=msg,
+                    )
+                    if synthesized and str(synthesized).strip():
+                        send_msg = str(synthesized).strip()
+                except Exception as exc:
+                    event_payload = getattr(event, "payload", None) or {}
+                    worker_summary = event_payload.get("summary") or msg
+                    send_msg = self._kanban_public_completion_fallback(
+                        worker_summary=worker_summary,
+                        worker_metadata=None,
+                    )
+                    logger.warning(
+                        "kanban notifier: synthesis failed for %s; using sanitized public fallback: %s",
+                        sub["task_id"], exc,
+                    )
+            adapter_started = time.monotonic()
+            adapter_status = "ok"
+            adapter_error = None
+            try:
+                result = await adapter.send(sub["chat_id"], send_msg, metadata=metadata)
+                if getattr(result, "success", True) is False:
+                    adapter_status = "error"
+                    adapter_error = getattr(result, "error", None) or "adapter returned success=False"
+                    raise RuntimeError(str(adapter_error))
+                _record_gateway_span("kanban.final_notification_sent")
             except Exception as exc:
-                logger.warning(
-                    "kanban notifier: synthesis failed for %s; falling back direct: %s",
-                    sub["task_id"], exc,
+                adapter_status = "error"
+                adapter_error = str(exc)
+                raise
+            finally:
+                _record_gateway_span(
+                    f"adapter.send.{str(sub.get('platform') or 'unknown').lower()}",
+                    duration_ms=(time.monotonic() - adapter_started) * 1000,
+                    status=adapter_status,
+                    error=adapter_error,
                 )
-                send_msg = msg
-        result = await adapter.send(sub["chat_id"], send_msg, metadata=metadata)
-        if getattr(result, "success", True) is False:
-            error = getattr(result, "error", None) or "adapter returned success=False"
-            raise RuntimeError(str(error))
+
+            try:
+                from gateway.mirror import mirror_to_session
+
+                mirrored = mirror_to_session(
+                    str(sub.get("platform") or ""),
+                    str(sub.get("chat_id") or ""),
+                    send_msg,
+                    source_label="kanban",
+                    thread_id=(str(sub.get("thread_id") or "") or None),
+                    user_id=(str(sub.get("user_id") or "") or None),
+                )
+            except Exception:
+                mirrored = False
+
+            logger.info(
+                "kanban notifier: sent %s event to %s:%s message_id=%s mirrored=%s",
+                sub["task_id"], sub["platform"], sub["chat_id"],
+                getattr(result, "message_id", None), mirrored,
+            )
 
         try:
-            from gateway.mirror import mirror_to_session
+            from gateway.config import Platform as _Platform
+            from gateway.session import SessionSource
 
-            mirrored = mirror_to_session(
-                str(sub.get("platform") or ""),
-                str(sub.get("chat_id") or ""),
-                send_msg,
-                source_label="kanban",
-                thread_id=(str(sub.get("thread_id") or "") or None),
-                user_id=(str(sub.get("user_id") or "") or None),
+            platform_str = str(sub.get("platform") or "telegram").lower()
+            platform = _Platform(platform_str)
+            source = SessionSource(
+                platform=platform,
+                chat_id=str(sub.get("chat_id") or ""),
+                user_id=str(sub.get("user_id") or "") or None,
+                thread_id=str(sub.get("thread_id") or "") or None,
             )
+            lock = self._conversation_lock_for_source(source)
         except Exception:
-            mirrored = False
+            lock = None
 
-        logger.info(
-            "kanban notifier: sent %s event to %s:%s message_id=%s mirrored=%s",
-            sub["task_id"], sub["platform"], sub["chat_id"],
-            getattr(result, "message_id", None), mirrored,
-        )
+        gateway_started = time.monotonic()
+        gateway_status = "ok"
+        gateway_error = None
+        try:
+            if lock is None:
+                await _send_and_mirror()
+            else:
+                async with lock:
+                    await _send_and_mirror()
+        except Exception as exc:
+            gateway_status = "error"
+            gateway_error = str(exc)
+            raise
+        finally:
+            _record_gateway_span(
+                "gateway.send",
+                duration_ms=(time.monotonic() - gateway_started) * 1000,
+                status=gateway_status,
+                error=gateway_error,
+            )
 
     @staticmethod
     def _build_kanban_synthesis_prompt(
@@ -3875,6 +4310,7 @@ class GatewayRunner:
         board: Optional[str],
         worker_summary: Any,
         worker_metadata: Any,
+        artifact_context: str = "",
         direct_message: str,
     ) -> str:
         """Build the user-facing completion synthesis prompt."""
@@ -3894,6 +4330,7 @@ class GatewayRunner:
             f"{str(getattr(task, 'body', '') or '')[:1200]}\n\n"
             f"Worker summary / durable handoff:\n{str(worker_summary or '')[:4000]}\n\n"
             f"Worker metadata JSON:\n{json.dumps(worker_metadata, ensure_ascii=False, default=str)[:3000]}\n\n"
+            f"Relevant artifact/report excerpts, if any:\n{str(artifact_context or '')[:12000]}\n\n"
             "Internal debug context (use only if the user's request is explicitly about internals/debugging):\n"
             f"Task id: {sub.get('task_id')}\n"
             f"Board: {board or 'default'}\n"
@@ -3903,6 +4340,171 @@ class GatewayRunner:
             f"Origin profile: {sub.get('origin_profile') or ''}\n"
             f"Direct fallback message: {direct_message}"
         )
+
+    @staticmethod
+    def _coerce_kanban_metadata(metadata: Any) -> Any:
+        if isinstance(metadata, str):
+            try:
+                return json.loads(metadata)
+            except Exception:
+                return metadata
+        return metadata
+
+    @staticmethod
+    def _read_kanban_artifact_context(
+        *,
+        task: Any,
+        worker_metadata: Any,
+        max_chars: int = 12000,
+    ) -> str:
+        """Return safe, small report/artifact excerpts for notification synthesis.
+
+        Workers often write the substantive answer to a markdown artifact and
+        keep the durable summary short ("created file at path"). The notifier
+        runs without tools, so proactively include bounded excerpts from known
+        kanban workspace report files. Restrict to text-like files under a
+        kanban workspace and skip suspicious names to avoid leaking secrets.
+        """
+        metadata = GatewayRunner._coerce_kanban_metadata(worker_metadata)
+        if not isinstance(metadata, dict):
+            return ""
+
+        candidates: list[str] = []
+        for key in (
+            "artifact_path", "report_path", "source_file", "summary_path",
+            "output_path", "markdown_path",
+        ):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+        for key in ("artifact_paths", "report_paths", "workspace_files_created"):
+            value = metadata.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str) and item.strip():
+                        candidates.append(item.strip())
+
+        workspace_path = str(getattr(task, "workspace_path", "") or "").strip()
+        resolved: list[Path] = []
+        for candidate in candidates:
+            path = Path(candidate).expanduser()
+            if not path.is_absolute() and workspace_path:
+                path = Path(workspace_path) / path
+            resolved.append(path)
+
+        allowed_root = Path(os.path.expanduser("~/.hermes/kanban/workspaces")).resolve()
+        workspace_root = None
+        if workspace_path:
+            try:
+                workspace_root = Path(workspace_path).expanduser().resolve()
+            except Exception:
+                workspace_root = None
+        allowed_suffixes = {".md", ".markdown", ".txt", ".rst", ".json", ".yaml", ".yml", ".csv"}
+        secret_name_re = re.compile(r"(secret|token|credential|auth|cookie|key|\.env)", re.I)
+        chunks: list[str] = []
+        seen: set[str] = set()
+        budget = max(0, int(max_chars))
+        for path in resolved:
+            if budget <= 0:
+                break
+            try:
+                real = path.resolve()
+                real_str = str(real)
+                if real_str in seen:
+                    continue
+                seen.add(real_str)
+                under_home_kanban = allowed_root in (real, *real.parents)
+                under_task_workspace = bool(
+                    workspace_root and workspace_root in (real, *real.parents)
+                )
+                parts = real.parts
+                under_any_hermes_kanban = any(
+                    parts[i:i + 3] == (".hermes", "kanban", "workspaces")
+                    for i in range(0, max(0, len(parts) - 2))
+                )
+                if not (under_home_kanban or under_task_workspace or under_any_hermes_kanban):
+                    continue
+                if real.suffix.lower() not in allowed_suffixes:
+                    continue
+                if secret_name_re.search(real.name):
+                    continue
+                if not real.is_file() or real.stat().st_size > 200_000:
+                    continue
+                text = real.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            text = text.strip()
+            if not text:
+                continue
+            excerpt = text[: min(len(text), budget)]
+            if len(text) > len(excerpt):
+                excerpt += "\n\n[artifact excerpt truncated]"
+            chunks.append(f"Artifact excerpt ({real.name}):\n{excerpt}")
+            budget -= len(excerpt)
+        return "\n\n---\n\n".join(chunks)
+
+    @staticmethod
+    def _sanitize_kanban_public_text(text: Any, *, max_chars: int = 12000) -> str:
+        """Remove internal Kanban plumbing from deterministic user-facing fallbacks."""
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return ""
+        cleaned = re.sub(r"`/[^`\n]+`", "the generated report", cleaned)
+        cleaned = re.sub(r"/Users/[^\s`，。]+", "the generated report", cleaned)
+        cleaned = re.sub(r"\bt_[0-9a-f]{8,}\b", "the task", cleaned)
+        cleaned = re.sub(r"@[A-Za-z0-9_-]+", "", cleaned)
+        cleaned = re.sub(r"\bKanban\b", "", cleaned)
+        cleaned = re.sub(r"\bworker(?:-[A-Za-z0-9_-]+)?\b", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"\bdispatcher\b", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" —-\n")
+        return cleaned[:max(0, int(max_chars))].strip()
+
+    @staticmethod
+    def _kanban_synthesis_timeout(user_config: Optional[dict]) -> float:
+        """Return bounded Kanban completion synthesis timeout in seconds."""
+        raw = ((user_config or {}).get("kanban") or {}).get(
+            "synthesis_timeout_seconds", 120
+        )
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = 120.0
+        return max(5.0, min(value, 300.0))
+
+    @staticmethod
+    def _kanban_synthesis_route(user_config: Optional[dict]) -> dict:
+        """Return sanitized route diagnostics for auxiliary Kanban synthesis."""
+        aux = (user_config or {}).get("auxiliary") or {}
+        route = aux.get("kanban_synthesis") if isinstance(aux, dict) else {}
+        route = route if isinstance(route, dict) else {}
+        return {
+            "provider": str(route.get("provider") or "openrouter").strip() or "openrouter",
+            "model": str(route.get("model") or "google/gemini-2.5-flash").strip() or "google/gemini-2.5-flash",
+            "base_url": str(route.get("base_url") or "").strip(),
+        }
+
+    @staticmethod
+    def _kanban_public_completion_fallback(
+        *,
+        worker_summary: Any,
+        worker_metadata: Any,
+        artifact_context: str = "",
+    ) -> str:
+        """Build a user-facing fallback when LLM synthesis times out/fails."""
+        artifact_context = str(artifact_context or "").strip()
+        if artifact_context:
+            text = re.sub(r"^Artifact excerpt \([^)]*\):\n", "", artifact_context, count=1).strip()
+            return GatewayRunner._sanitize_kanban_public_text(text, max_chars=12000) or "Done."
+        summary = GatewayRunner._sanitize_kanban_public_text(worker_summary, max_chars=4000)
+        if summary:
+            return summary or "Done."
+        metadata = GatewayRunner._coerce_kanban_metadata(worker_metadata)
+        if isinstance(metadata, dict):
+            for key in ("recommendation", "result", "decision", "summary"):
+                value = metadata.get(key)
+                if value:
+                    return GatewayRunner._sanitize_kanban_public_text(value, max_chars=4000) or "Done."
+        return "Done."
 
     async def _synthesize_kanban_notification(
         self,
@@ -3921,7 +4523,6 @@ class GatewayRunner:
         """
         from gateway.config import Platform as _Platform
         from gateway.session import SessionSource
-        from run_agent import AIAgent
 
         platform_str = str(sub.get("platform") or "telegram").lower()
         try:
@@ -3939,8 +4540,6 @@ class GatewayRunner:
             source=source,
             user_config=user_config,
         )
-        if not runtime_kwargs.get("api_key"):
-            raise RuntimeError("no provider credentials configured for synthesis")
 
         event_payload = getattr(event, "payload", None) or {}
         run = None
@@ -3961,6 +4560,11 @@ class GatewayRunner:
             or direct_message
         )
         worker_metadata = run.metadata if run and run.metadata is not None else None
+        worker_metadata = self._coerce_kanban_metadata(worker_metadata)
+        artifact_context = self._read_kanban_artifact_context(
+            task=task,
+            worker_metadata=worker_metadata,
+        )
         prompt = self._build_kanban_synthesis_prompt(
             sub=sub,
             event=event,
@@ -3968,38 +4572,96 @@ class GatewayRunner:
             board=board,
             worker_summary=worker_summary,
             worker_metadata=worker_metadata,
+            artifact_context=artifact_context,
             direct_message=direct_message,
         )
 
+        fallback_reply = self._kanban_public_completion_fallback(
+            worker_summary=worker_summary,
+            worker_metadata=worker_metadata,
+            artifact_context=artifact_context,
+        )
+
+        route = self._kanban_synthesis_route(user_config)
+        timeout_s = self._kanban_synthesis_timeout(user_config)
+        prompt_chars = len(prompt)
+        context_chars = (
+            len(str(sub.get("origin_context") or ""))
+            + len(str(worker_summary or ""))
+            + len(json.dumps(worker_metadata, ensure_ascii=False, default=str))
+            + len(str(artifact_context or ""))
+        )
+
         def run_sync() -> str:
-            agent = AIAgent(
-                model=model,
-                **runtime_kwargs,
-                max_iterations=1,
-                quiet_mode=True,
-                verbose_logging=False,
-                enabled_toolsets=[],
-                disabled_toolsets=None,
-                session_id=f"kanban_synth_{sub.get('task_id')}_{getattr(event, 'id', int(time.time()))}",
-                platform=platform_str,
-                user_id=source.user_id,
-                chat_id=source.chat_id,
-                thread_id=source.thread_id,
-                session_db=getattr(self, "_session_db", None),
-                fallback_model=getattr(self, "_fallback_model", None),
-                skip_context_files=True,
+            from agent.auxiliary_client import call_llm
+
+            main_runtime = dict(runtime_kwargs or {})
+            main_runtime["model"] = model
+            response = call_llm(
+                task="kanban_synthesis",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=900,
+                timeout=timeout_s,
+                main_runtime=main_runtime,
             )
             try:
-                result = agent.run_conversation(user_message=prompt)
-                return str((result or {}).get("final_response") or "").strip()
-            finally:
-                self._cleanup_agent_resources(agent)
+                content = response.choices[0].message.content
+            except Exception:
+                content = ""
+            return str(content or "").strip()
 
-        timeout_s = int((user_config.get("kanban") or {}).get("synthesis_timeout_seconds", 45))
-        return await asyncio.wait_for(
-            self._run_in_executor_with_context(run_sync),
-            timeout=max(5, timeout_s),
-        )
+        started = time.monotonic()
+        synthesis_status = "ok"
+        synthesis_error = None
+        try:
+            return await asyncio.wait_for(
+                self._run_in_executor_with_context(run_sync),
+                timeout=timeout_s,
+            )
+        except Exception as exc:
+            synthesis_status = "error"
+            synthesis_error = str(exc) or type(exc).__name__
+            elapsed = time.monotonic() - started
+            is_timeout = isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+            if fallback_reply:
+                logger.warning(
+                    "kanban notifier: synthesis failed; using sanitized public fallback "
+                    "exc_type=%s timeout=%s elapsed=%.2fs provider=%s model=%s "
+                    "prompt_chars=%d context_chars=%d task=%s",
+                    type(exc).__name__,
+                    is_timeout,
+                    elapsed,
+                    route.get("provider") or "auto",
+                    route.get("model") or "default",
+                    prompt_chars,
+                    context_chars,
+                    sub.get("task_id"),
+                    exc_info=True,
+                )
+                return fallback_reply
+            raise
+        finally:
+            try:
+                from agent.telemetry import record_span_event
+
+                record_span_event(
+                    "kanban.synthesis",
+                    platform="gateway",
+                    profile=str(sub.get("origin_profile") or ""),
+                    duration_ms=(time.monotonic() - started) * 1000,
+                    status=synthesis_status,
+                    error=synthesis_error,
+                    attributes={
+                        "platform": platform_str,
+                        "notification_mode": str(sub.get("notification_mode") or "direct"),
+                        "task_id": str(sub.get("task_id") or ""),
+                        "request_id": str(sub.get("request_id") or ""),
+                        "task_status": str(getattr(task, "status", "") or ""),
+                    },
+                )
+            except Exception:
+                pass
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,
@@ -5870,6 +6532,9 @@ class GatewayRunner:
         if canonical == "usage":
             return await self._handle_usage_command(event)
 
+        if canonical == "metrics":
+            return await self._handle_metrics_command(event)
+
         if canonical == "insights":
             return await self._handle_insights_command(event)
 
@@ -6064,61 +6729,63 @@ class GatewayRunner:
                 return self._telegram_topic_root_lobby_message()
             return None
 
-        # ── Claim this session before any await ───────────────────────
-        # Between here and _run_agent registering the real AIAgent, there
-        # are numerous await points (hooks, vision enrichment, STT,
-        # session hygiene compression).  Without this sentinel a second
-        # message arriving during any of those yields would pass the
-        # "already running" guard and spin up a duplicate agent for the
-        # same session — corrupting the transcript.
-        self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
-        self._running_agents_ts[_quick_key] = time.time()
-        _run_generation = self._begin_session_run_generation(_quick_key)
+        conversation_lock = self._conversation_lock_for_key(_quick_key)
+        async with conversation_lock:
+            # ── Claim this session before any await ───────────────────────
+            # Between here and _run_agent registering the real AIAgent, there
+            # are numerous await points (hooks, vision enrichment, STT,
+            # session hygiene compression).  Without this sentinel a second
+            # message arriving during any of those yields would pass the
+            # "already running" guard and spin up a duplicate agent for the
+            # same session — corrupting the transcript.
+            self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
+            self._running_agents_ts[_quick_key] = time.time()
+            _run_generation = self._begin_session_run_generation(_quick_key)
 
-        try:
-            _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
-            # Goal continuation: after the agent returns a final response
-            # for this turn, check any standing /goal — the judge will
-            # either mark it done, pause it (budget), or enqueue a
-            # continuation prompt back through the adapter FIFO so the
-            # next turn makes more progress. Wrapped in try/except so a
-            # broken judge never breaks normal message handling.
             try:
-                _final_text = ""
-                if isinstance(_agent_result, dict):
-                    _final_text = str(_agent_result.get("final_response") or "")
-                elif isinstance(_agent_result, str):
-                    _final_text = _agent_result
-                # Skip for empty responses (interrupted / errored) — the
-                # judge would almost always say "continue" and we'd loop
-                # on error. Let the user drive the next turn.
-                if _final_text.strip():
-                    try:
-                        session_entry = self.session_store.get_or_create_session(source)
-                    except Exception:
-                        session_entry = None
-                    if session_entry is not None:
-                        self._post_turn_goal_continuation(
-                            session_entry=session_entry,
-                            source=source,
-                            final_response=_final_text,
-                        )
-            except Exception as _goal_exc:
-                logger.debug("goal continuation hook failed: %s", _goal_exc)
-            return _agent_result
-        finally:
-            # If _run_agent replaced the sentinel with a real agent and
-            # then cleaned it up, this is a no-op.  If we exited early
-            # (exception, command fallthrough, etc.) the sentinel must
-            # not linger or the session would be permanently locked out.
-            if self._running_agents.get(_quick_key) is _AGENT_PENDING_SENTINEL:
-                self._release_running_agent_state(_quick_key)
-            else:
-                # Agent path already cleaned _running_agents; make sure
-                # the paired metadata dicts are gone too.
-                self._running_agents_ts.pop(_quick_key, None)
-                if hasattr(self, "_busy_ack_ts"):
-                    self._busy_ack_ts.pop(_quick_key, None)
+                _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+                # Goal continuation: after the agent returns a final response
+                # for this turn, check any standing /goal — the judge will
+                # either mark it done, pause it (budget), or enqueue a
+                # continuation prompt back through the adapter FIFO so the
+                # next turn makes more progress. Wrapped in try/except so a
+                # broken judge never breaks normal message handling.
+                try:
+                    _final_text = ""
+                    if isinstance(_agent_result, dict):
+                        _final_text = str(_agent_result.get("final_response") or "")
+                    elif isinstance(_agent_result, str):
+                        _final_text = _agent_result
+                    # Skip for empty responses (interrupted / errored) — the
+                    # judge would almost always say "continue" and we'd loop
+                    # on error. Let the user drive the next turn.
+                    if _final_text.strip():
+                        try:
+                            session_entry = self.session_store.get_or_create_session(source)
+                        except Exception:
+                            session_entry = None
+                        if session_entry is not None:
+                            self._post_turn_goal_continuation(
+                                session_entry=session_entry,
+                                source=source,
+                                final_response=_final_text,
+                            )
+                except Exception as _goal_exc:
+                    logger.debug("goal continuation hook failed: %s", _goal_exc)
+                return _agent_result
+            finally:
+                # If _run_agent replaced the sentinel with a real agent and
+                # then cleaned it up, this is a no-op.  If we exited early
+                # (exception, command fallthrough, etc.) the sentinel must
+                # not linger or the session would be permanently locked out.
+                if self._running_agents.get(_quick_key) is _AGENT_PENDING_SENTINEL:
+                    self._release_running_agent_state(_quick_key)
+                else:
+                    # Agent path already cleaned _running_agents; make sure
+                    # the paired metadata dicts are gone too.
+                    self._running_agents_ts.pop(_quick_key, None)
+                    if hasattr(self, "_busy_ack_ts"):
+                        self._busy_ack_ts.pop(_quick_key, None)
 
     async def _prepare_inbound_message_text(
         self,
@@ -6369,12 +7036,24 @@ class GatewayRunner:
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
+        _gateway_request_id = str(uuid.uuid4())
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         logger.info(
-            "inbound message: platform=%s user=%s chat=%s msg=%r",
+            "inbound message: platform=%s user=%s chat=%s gateway_request_id=%s msg=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown", _msg_preview,
+            source.chat_id or "unknown", _gateway_request_id, _msg_preview,
+        )
+        _record_gateway_telemetry_span(
+            "gateway.message_received",
+            platform=_platform_name,
+            attributes={
+                "gateway_request_id": _gateway_request_id,
+                "chat_type": source.chat_type or "",
+                "message_type": getattr(event.message_type, "value", str(event.message_type)),
+                "message_len": len(event.text or ""),
+                "has_media": bool(event.media_urls),
+            },
         )
 
         # Get or create session
@@ -6930,6 +7609,96 @@ class GatewayRunner:
         if message_text is None:
             return
 
+        # Phase 1 TTFA: conservative Telegram/Weixin DM pre-LLM acknowledgement
+        # for likely long/delegated work.  This happens after command handling
+        # and inbound preprocessing, but before the full model run.  Weixin
+        # groups stay quiet here unless the adapter later exposes explicit
+        # address/mention metadata; this preserves existing group trigger rules.
+        _pre_llm_ack_sent = False
+        _pre_llm_ack_reason = "ineligible_source"
+        _pre_llm_ack_send_success = None
+        _ack_source_eligible, _ack_source_reason = _pre_llm_ack_eligible_source(
+            source.platform,
+            source.chat_type,
+        )
+        _pre_llm_ack_reason = _ack_source_reason
+        if (
+            _ack_source_eligible
+            and event.message_type == MessageType.TEXT
+        ):
+            _decision_start_ms = int(time.time() * 1000)
+            try:
+                _should_ack, _pre_llm_ack_reason = _should_send_pre_llm_ack(
+                    message_text,
+                    is_command=bool(event.get_command()),
+                )
+            except Exception as _ack_decision_exc:
+                _should_ack = False
+                _pre_llm_ack_reason = "decision_error"
+                logger.debug("pre-LLM ack decision failed: %s", _ack_decision_exc)
+            _decision_end_ms = int(time.time() * 1000)
+            _record_gateway_telemetry_span(
+                "gateway.pre_llm_ack.decision",
+                platform=_platform_name,
+                attributes={
+                    "gateway_request_id": _gateway_request_id,
+                    "decision": bool(_should_ack),
+                    "reason": _pre_llm_ack_reason,
+                    "message_len": len(message_text or ""),
+                },
+                started_at_ms=_decision_start_ms,
+                ended_at_ms=_decision_end_ms,
+            )
+            if _should_ack:
+                _ack_adapter = self.adapters.get(source.platform)
+                _ack_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                _ack_start_ms = int(time.time() * 1000)
+                _ack_error = None
+                try:
+                    if _ack_adapter and source.chat_id:
+                        _ack_result = await _ack_adapter.send(
+                            source.chat_id,
+                            "Got it — checking.",
+                            metadata=_ack_meta,
+                        )
+                        _pre_llm_ack_send_success = bool(getattr(_ack_result, "success", False))
+                        _pre_llm_ack_sent = _pre_llm_ack_send_success
+                        if not _pre_llm_ack_send_success:
+                            _ack_error = str(getattr(_ack_result, "error", "send returned failure") or "send returned failure")[:300]
+                    else:
+                        _pre_llm_ack_send_success = False
+                        _ack_error = "missing_adapter_or_chat"
+                except Exception as _ack_exc:
+                    _pre_llm_ack_send_success = False
+                    _ack_error = str(_ack_exc)[:300]
+                    logger.debug("pre-LLM ack send failed: %s", _ack_exc)
+                _ack_end_ms = int(time.time() * 1000)
+                _record_gateway_telemetry_span(
+                    "gateway.pre_llm_ack.send",
+                    platform=_platform_name,
+                    status="ok" if _pre_llm_ack_send_success else "error",
+                    error=_ack_error,
+                    attributes={
+                        "gateway_request_id": _gateway_request_id,
+                        "pre_llm_ack_sent": bool(_pre_llm_ack_sent),
+                        "send_success": bool(_pre_llm_ack_send_success),
+                        "reason": _pre_llm_ack_reason,
+                    },
+                    started_at_ms=_ack_start_ms,
+                    ended_at_ms=_ack_end_ms,
+                )
+        else:
+            _record_gateway_telemetry_span(
+                "gateway.pre_llm_ack.decision",
+                platform=_platform_name,
+                attributes={
+                    "gateway_request_id": _gateway_request_id,
+                    "decision": False,
+                    "reason": _pre_llm_ack_reason,
+                    "message_len": len(message_text or ""),
+                },
+            )
+
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
         # same run that registered them.
@@ -6946,8 +7715,21 @@ class GatewayRunner:
                 "user_id": source.user_id,
                 "session_id": session_entry.session_id,
                 "message": message_text[:500],
+                "gateway_request_id": _gateway_request_id,
+                "pre_llm_ack_sent": _pre_llm_ack_sent,
             }
             await self.hooks.emit("agent:start", hook_ctx)
+
+            _record_gateway_telemetry_span(
+                "gateway.agent_run.start",
+                platform=_platform_name,
+                attributes={
+                    "gateway_request_id": _gateway_request_id,
+                    "session_id": session_entry.session_id,
+                    "pre_llm_ack_sent": bool(_pre_llm_ack_sent),
+                    "ack_reason": _pre_llm_ack_reason,
+                },
+            )
 
             # Run the agent
             agent_result = await self._run_agent(
@@ -6960,6 +7742,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
+                gateway_request_id=_gateway_request_id,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -7690,6 +8473,7 @@ class GatewayRunner:
             m = re.search(r"Created\s+(t_[0-9a-f]+)\b", output)
             if m:
                 task_id = m.group(1)
+                request_id = f"req_{uuid.uuid4().hex}"
                 try:
                     source = event.source
                     platform = getattr(source, "platform", None)
@@ -7709,10 +8493,27 @@ class GatewayRunner:
                                     platform=platform_str, chat_id=chat_id,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
+                                    request_id=request_id,
                                 )
                             finally:
                                 conn.close()
                         await asyncio.to_thread(_sub)
+                        try:
+                            from agent.telemetry import record_span_event
+                            base_attrs = {
+                                "request_id": request_id,
+                                "task_id": task_id,
+                                "kanban_task_id": task_id,
+                                "platform": platform_str,
+                                "notification_mode": "direct",
+                                "request_class": "async_kanban",
+                                "source": "slash_command",
+                            }
+                            record_span_event("gateway.request", platform=platform_str, attributes=base_attrs)
+                            record_span_event("kanban.task_created", platform="kanban", attributes=base_attrs)
+                            record_span_event("kanban.dispatch_ack_sent", platform="kanban", attributes=base_attrs)
+                        except Exception:
+                            pass
                         output = (
                             output.rstrip()
                             + f"\n(subscribed — you'll be notified when {task_id} "
@@ -7988,9 +8789,13 @@ class GatewayRunner:
         # When running under a service manager (systemd/launchd), use the
         # service restart path: exit with code 75 so the service manager
         # restarts us.  The detached subprocess approach (setsid + bash)
-        # doesn't work under systemd because KillMode=mixed kills all
-        # processes in the cgroup, including the detached helper.
-        _under_service = bool(os.environ.get("INVOCATION_ID"))  # systemd sets this
+        # does not work reliably under service managers: systemd can kill
+        # helpers in the cgroup, and launchd may treat a clean exit as a
+        # completed job instead of relaunching it.
+        _under_service = bool(
+            os.environ.get("INVOCATION_ID")  # systemd
+            or os.environ.get("XPC_SERVICE_NAME")  # launchd
+        )
         if _under_service:
             self.request_restart(detached=False, via_service=True)
         else:
@@ -10809,6 +11614,21 @@ class GatewayRunner:
             f"Use `/resume` to switch back to the original."
         )
 
+    async def _handle_metrics_command(self, event: MessageEvent) -> str:
+        """Handle /metrics command -- concise local latency telemetry."""
+        hours = 24.0
+        args = event.get_command_args().strip()
+        if args:
+            try:
+                hours = max(0.1, float(args.split()[0]))
+            except Exception:
+                return "Usage: /metrics [hours]"
+        try:
+            from agent.telemetry import format_metrics_summary
+            return format_metrics_summary(window_hours=hours)
+        except Exception as exc:
+            return f"Telemetry metrics unavailable: {exc}"
+
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the current session.
 
@@ -11943,9 +12763,10 @@ class GatewayRunner:
                 return None
 
             metadata = {"thread_id": thread_id} if thread_id else None
+            locale = self.config.get_system_message_locale(platform)
             result = await adapter.send(
                 str(chat_id),
-                "♻ Gateway restarted successfully. Your session continues.",
+                _gateway_system_message(locale, "restart_complete"),
                 metadata=metadata,
             )
             # adapter.send() catches provider errors (e.g. "Chat not found")
@@ -11986,7 +12807,6 @@ class GatewayRunner:
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = "♻️ Gateway online — Hermes is back and ready."
 
         for platform, adapter in self.adapters.items():
             home = self.config.get_home_channel(platform)
@@ -12007,6 +12827,10 @@ class GatewayRunner:
 
             try:
                 metadata = {"thread_id": home.thread_id} if home.thread_id else None
+                message = _gateway_system_message(
+                    self.config.get_system_message_locale(platform),
+                    "online",
+                )
                 if metadata:
                     result = await adapter.send(str(home.chat_id), message, metadata=metadata)
                 else:
@@ -13274,6 +14098,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        gateway_request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -14050,6 +14875,7 @@ class GatewayRunner:
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
+            agent.gateway_request_id = gateway_request_id or ""
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []
@@ -14640,14 +15466,21 @@ class GatewayRunner:
         
         interrupt_monitor = asyncio.create_task(monitor_for_interrupt())
 
-        # Periodic "still working" notifications for long-running tasks.
-        # Fires every N seconds so the user knows the agent hasn't died.
-        # Config: agent.gateway_notify_interval in config.yaml, or
-        # HERMES_AGENT_NOTIFY_INTERVAL env var.  Default 180s (3 min).
-        # 0 = disable notifications.
+        # Public long-task progress for Telegram + main Weixin only.  This is
+        # deliberately separate from verbose tool progress: it is sparse,
+        # sanitized, rate-limited, and never includes task/run/tool IDs.
+        # Config: agent.gateway_notify_interval / HERMES_AGENT_NOTIFY_INTERVAL
+        # controls the minimum cadence; values below 120s are clamped to avoid
+        # chat spam.  0 disables public progress.
         _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
-        _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
-        _notify_start = time.time()
+        _NOTIFY_INTERVAL = (
+            max(_NOTIFY_INTERVAL_RAW, _PUBLIC_LONG_PROGRESS_MIN_INTERVAL_S)
+            if _NOTIFY_INTERVAL_RAW > 0
+            else None
+        )
+        _notify_start_mono = time.monotonic()
+        _last_public_progress_sent = [None]
+        _last_public_progress_phase = [None]
 
         async def _notify_long_running():
             if _NOTIFY_INTERVAL is None:
@@ -14655,29 +15488,43 @@ class GatewayRunner:
             _notify_adapter = self.adapters.get(source.platform)
             if not _notify_adapter:
                 return
+            # Poll often enough to catch phase changes promptly while the
+            # helper enforces the real user-visible cadence.
+            _poll_interval = min(15.0, max(5.0, _NOTIFY_INTERVAL / 12.0))
             while True:
-                await asyncio.sleep(_NOTIFY_INTERVAL)
-                _elapsed_mins = int((time.time() - _notify_start) // 60)
-                # Include agent activity context if available.
+                await asyncio.sleep(_poll_interval)
+                _now = time.monotonic()
+                _elapsed = _now - _notify_start_mono
                 _agent_ref = agent_holder[0]
-                _status_detail = ""
+                _activity = None
                 if _agent_ref and hasattr(_agent_ref, "get_activity_summary"):
                     try:
-                        _a = _agent_ref.get_activity_summary()
-                        _parts = [f"iteration {_a['api_call_count']}/{_a['max_iterations']}"]
-                        if _a.get("current_tool"):
-                            _parts.append(f"running: {_a['current_tool']}")
-                        else:
-                            _parts.append(_a.get("last_activity_desc", ""))
-                        _status_detail = " — " + ", ".join(_parts)
+                        _activity = _agent_ref.get_activity_summary()
                     except Exception:
-                        pass
+                        _activity = None
+                _phase = _public_progress_phase(_activity)
+                _should_send, _reason = _should_send_public_progress(
+                    platform=source.platform,
+                    profile_name=os.getenv("HERMES_PROFILE"),
+                    hermes_home=str(_hermes_home),
+                    elapsed_s=_elapsed,
+                    now_s=_now,
+                    last_sent_s=_last_public_progress_sent[0],
+                    last_phase=_last_public_progress_phase[0],
+                    phase=_phase,
+                    min_interval_s=_NOTIFY_INTERVAL,
+                )
+                if not _should_send:
+                    continue
                 try:
                     _notify_res = await _notify_adapter.send(
                         source.chat_id,
-                        f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})",
+                        _public_progress_message(source.platform, _phase),
                         metadata=_status_thread_metadata,
                     )
+                    if getattr(_notify_res, "success", False):
+                        _last_public_progress_sent[0] = time.monotonic()
+                        _last_public_progress_phase[0] = _phase
                     if (
                         _cleanup_progress
                         and getattr(_notify_res, "success", False)

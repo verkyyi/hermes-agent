@@ -337,6 +337,7 @@ _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify_on_complete", "watch_pa
 def _rpc_server_loop(
     server_sock: socket.socket,
     task_id: str,
+    request_id: Optional[str],
     tool_call_log: list,
     tool_call_counter: list,   # mutable [int] so the thread can increment
     max_tool_calls: int,
@@ -420,7 +421,8 @@ def _rpc_server_loop(
                         sys.stdout = devnull
                         sys.stderr = devnull
                         result = handle_function_call(
-                            tool_name, tool_args, task_id=task_id
+                            tool_name, tool_args, task_id=task_id,
+                            request_id=request_id,
                         )
                     finally:
                         sys.stdout, sys.stderr = _real_stdout, _real_stderr
@@ -598,6 +600,7 @@ def _rpc_poll_loop(
     env,
     rpc_dir: str,
     task_id: str,
+    request_id: Optional[str],
     tool_call_log: list,
     tool_call_counter: list,
     max_tool_calls: int,
@@ -694,7 +697,8 @@ def _rpc_poll_loop(
                             sys.stdout = devnull
                             sys.stderr = devnull
                             tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
+                                tool_name, tool_args, task_id=task_id,
+                                request_id=request_id,
                             )
                         finally:
                             sys.stdout, sys.stderr = _real_stdout, _real_stderr
@@ -740,6 +744,7 @@ def _execute_remote(
     code: str,
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
+    request_id: Optional[str] = None,
 ) -> str:
     """Run a script on the remote terminal backend via file-based RPC.
 
@@ -807,6 +812,7 @@ def _execute_remote(
             target=_rpc_poll_loop,
             args=(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
+                request_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
                 sandbox_tools, stop_event,
             ),
@@ -935,6 +941,7 @@ def execute_code(
     code: str,
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
+    request_id: Optional[str] = None,
 ) -> str:
     """
     Run a Python script in a sandboxed child process with RPC access
@@ -946,6 +953,7 @@ def execute_code(
     Args:
         code:          Python source code to execute.
         task_id:       Session task ID for tool isolation (terminal env, etc.).
+        request_id:    Foreground request id for nested tool-call telemetry.
         enabled_tools: Tool names enabled in the current session. The sandbox
                        gets the intersection with SANDBOX_ALLOWED_TOOLS.
 
@@ -964,7 +972,7 @@ def execute_code(
     from tools.terminal_tool import _get_env_config
     env_type = _get_env_config()["env_type"]
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools)
+        return _execute_remote(code, task_id, enabled_tools, request_id=request_id)
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
 
@@ -1017,7 +1025,7 @@ def execute_code(
         rpc_thread = threading.Thread(
             target=_rpc_server_loop,
             args=(
-                server_sock, task_id, tool_call_log,
+                server_sock, task_id, request_id, tool_call_log,
                 tool_call_counter, max_tool_calls, sandbox_tools,
             ),
             daemon=True,
@@ -1614,7 +1622,8 @@ registry.register(
     handler=lambda args, **kw: execute_code(
         code=args.get("code", ""),
         task_id=kw.get("task_id"),
-        enabled_tools=kw.get("enabled_tools")),
+        enabled_tools=kw.get("enabled_tools"),
+        request_id=kw.get("request_id")),
     check_fn=check_sandbox_requirements,
     emoji="🐍",
     max_result_size_chars=100_000,

@@ -49,6 +49,22 @@ Unless the user's setup has customized profiles, assume these exist. Adjust to w
 | `ops` | Runs scripts, manages services, handles deployments | `dir:` into ops scripts repo |
 | `pm` | Writes specs, acceptance criteria | `scratch` |
 
+### Security / ops audit routing
+
+Owner-authorized defensive audits — service exposure reviews, SSH/firewall
+posture checks, security-audit triage, incident/log review, and similar
+security-adjacent ops work — should be assigned to an ops/security-capable
+worker profile, not a generic coding or front-desk profile. Prefer a profile
+whose configured provider/model is known to handle defensive security work
+without brittle provider refusals. If no such profile/provider is configured,
+create a blocker or ask the human to choose/configure one before spawning the
+audit task; do not let the worker fail mid-run under a provider safety filter.
+
+For task bodies, make the authorization and scope explicit (owned systems,
+defensive review, no exploitation beyond agreed checks). If the task needs
+local shell/network inspection, use an ops-style workspace/profile and include
+only the specific checks requested.
+
 ## Decomposition playbook
 
 ### Step 1 — Understand the goal

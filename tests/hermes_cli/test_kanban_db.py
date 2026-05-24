@@ -18,6 +18,13 @@ def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    for var in (
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_HOME",
+    ):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
@@ -45,6 +52,33 @@ def test_init_creates_expected_tables(kanban_home):
         ).fetchall()
     names = {r["name"] for r in rows}
     assert {"tasks", "task_links", "task_comments", "task_events"} <= names
+
+
+def test_notify_sub_request_id_roundtrips(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="correlated", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="123",
+            thread_id="456",
+            user_id="u1",
+            notification_mode="synthesize",
+            request_id="req_abc123",
+        )
+        subs = kb.list_notify_subs(conn, task_id)
+        attrs = kb._task_correlation_attrs(conn, task_id)
+
+    assert len(subs) == 1
+    assert subs[0]["request_id"] == "req_abc123"
+    assert subs[0]["notification_mode"] == "synthesize"
+    assert attrs == {
+        "task_id": task_id,
+        "request_id": "req_abc123",
+        "notification_mode": "synthesize",
+        "platform": "telegram",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +521,31 @@ def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawna
         # Must return to ready so the next tick can retry.
         assert kb.get_task(conn, t).status == "ready"
         assert kb.get_task(conn, t).claim_lock is None
+
+
+def test_dispatch_and_completion_emit_segmented_telemetry(kanban_home, all_assignees_spawnable, monkeypatch):
+    recorded = []
+    monkeypatch.setattr(kb, "_record_kanban_span", lambda name, **kw: recorded.append((name, kw)))
+
+    def fake_spawn(task, workspace):
+        return 12345
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="telemetry", assignee="worker")
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert res.spawned and res.spawned[0][0] == tid
+        assert kb.complete_task(conn, tid, summary="done") is True
+
+    names = [name for name, _ in recorded]
+    assert "queue.wait" in names
+    assert "worker.spawn" in names
+    assert "worker.run" in names
+    for _name, kwargs in recorded:
+        attrs = kwargs.get("attributes") or {}
+        # Safe correlation metadata only: request/task correlation is OK, but no raw message/body content.
+        assert attrs.get("task_id") == tid
+        assert "message" not in attrs
+        assert "body" not in attrs
 
 
 def test_dispatch_reclaims_stale_before_spawning(kanban_home):

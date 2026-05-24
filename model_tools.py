@@ -33,6 +33,68 @@ from toolsets import resolve_toolset, validate_toolset
 logger = logging.getLogger(__name__)
 
 
+def _start_kanban_tool_heartbeat(function_name: str, function_args: Dict[str, Any]):
+    """Start a best-effort heartbeat thread for long blocking registry tools.
+
+    Terminal commands heartbeat inside tools.environments.base while the process
+    is running.  Browser/cloud tools can block in HTTP/navigation calls before
+    returning to the agent loop, so this monitor keeps Kanban claims alive for
+    those long calls without involving the LLM.
+    """
+    if not str(function_name or "").startswith("browser_"):
+        return None
+    task_id = __import__("os").environ.get("HERMES_KANBAN_TASK")
+    if not task_id:
+        return None
+    stop = threading.Event()
+
+    def _label() -> str:
+        if function_name == "browser_navigate" and isinstance(function_args, dict):
+            url = str(function_args.get("url") or "").strip()
+            if len(url) > 80:
+                url = url[:77] + "..."
+            return f"browser navigation running: {url}" if url else "browser navigation running"
+        if function_name in {"browser_snapshot", "browser_get_images", "browser_vision"}:
+            return "browser crawl/snapshot running"
+        return "browser operation running"
+
+    def _run() -> None:
+        try:
+            from hermes_cli import kanban_db as kb
+            import os
+
+            start = time.monotonic()
+            last = start
+            # First heartbeat after 60s, then every 60s.
+            while not stop.wait(5.0):
+                now = time.monotonic()
+                if now - start < 60.0 or now - last < 60.0:
+                    continue
+                last = now
+                from agent.redact import redact_sensitive_text
+
+                note = redact_sensitive_text(
+                    f"{_label()} ({int(now - start)}s elapsed)",
+                    force=True,
+                )
+                claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+                run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
+                expected_run_id = int(run_id_raw) if run_id_raw else None
+                conn = kb.connect()
+                try:
+                    if claim_lock:
+                        kb.heartbeat_claim(conn, task_id, claimer=claim_lock)
+                    kb.heartbeat_worker(conn, task_id, note=note, expected_run_id=expected_run_id)
+                finally:
+                    conn.close()
+        except Exception:
+            logger.debug("kanban long-tool heartbeat failed", exc_info=True)
+
+    thread = threading.Thread(target=_run, name=f"kanban-heartbeat-{function_name}", daemon=True)
+    thread.start()
+    return stop
+
+
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
 # =============================================================================
@@ -689,6 +751,7 @@ def handle_function_call(
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
+    request_id: Optional[str] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -698,6 +761,7 @@ def handle_function_call(
         function_args: Arguments for the function.
         task_id: Unique identifier for terminal/browser session isolation.
         session_id: Hermes conversation/session id for provenance-aware tools.
+        request_id: Foreground request id used to correlate async Kanban/telemetry events.
         platform/chat_id/thread_id/user_id: Optional origin surface metadata.
         user_task: The user's original task (for browser_snapshot context).
         enabled_tools: Tool names enabled for this session.  When provided,
@@ -759,31 +823,38 @@ def handle_function_call(
         # to wrap every tool manually.  We use monotonic() so the value is
         # unaffected by wall-clock adjustments during the call.
         _dispatch_start = time.monotonic()
-        if function_name == "execute_code":
-            # Prefer the caller-provided list so subagents can't overwrite
-            # the parent's tool set via the process-global.
-            sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
-            result = registry.dispatch(
-                function_name, function_args,
-                task_id=task_id,
-                enabled_tools=sandbox_enabled,
-                session_id=session_id,
-                platform=platform,
-                chat_id=chat_id,
-                thread_id=thread_id,
-                user_id=user_id,
-            )
-        else:
-            result = registry.dispatch(
-                function_name, function_args,
-                task_id=task_id,
-                user_task=user_task,
-                session_id=session_id,
-                platform=platform,
-                chat_id=chat_id,
-                thread_id=thread_id,
-                user_id=user_id,
-            )
+        _heartbeat_stop = _start_kanban_tool_heartbeat(function_name, function_args)
+        try:
+            if function_name == "execute_code":
+                # Prefer the caller-provided list so subagents can't overwrite
+                # the parent's tool set via the process-global.
+                sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
+                result = registry.dispatch(
+                    function_name, function_args,
+                    task_id=task_id,
+                    enabled_tools=sandbox_enabled,
+                    session_id=session_id,
+                    request_id=request_id,
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                )
+            else:
+                result = registry.dispatch(
+                    function_name, function_args,
+                    task_id=task_id,
+                    user_task=user_task,
+                    session_id=session_id,
+                    request_id=request_id,
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                )
+        finally:
+            if _heartbeat_stop is not None:
+                _heartbeat_stop.set()
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 
         try:
@@ -796,6 +867,7 @@ def handle_function_call(
                 task_id=task_id or "",
                 session_id=session_id or "",
                 tool_call_id=tool_call_id or "",
+                request_id=request_id or "",
                 duration_ms=duration_ms,
             )
         except Exception as _hook_err:
@@ -817,6 +889,7 @@ def handle_function_call(
                 task_id=task_id or "",
                 session_id=session_id or "",
                 tool_call_id=tool_call_id or "",
+                request_id=request_id or "",
                 duration_ms=duration_ms,
             )
             for hook_result in hook_results:
@@ -829,7 +902,16 @@ def handle_function_call(
         return result
 
     except Exception as e:
-        error_msg = f"Error executing {function_name}: {str(e)}"
+        detail = str(e)
+        if "unexpected keyword argument 'request_id'" in detail or "unexpected keyword argument: request_id" in detail:
+            error_msg = (
+                f"Tool-runtime failure executing {function_name}: {detail}. "
+                "This looks like a Hermes dispatcher/metadata-kwarg regression; "
+                "switch to local break-glass self-repair (`hermes break-glass diagnose && "
+                "hermes break-glass smoke`) before retrying Kanban work."
+            )
+        else:
+            error_msg = f"Error executing {function_name}: {detail}"
         logger.exception(error_msg)
         return json.dumps({"error": error_msg}, ensure_ascii=False)
 

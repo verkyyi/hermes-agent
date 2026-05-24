@@ -62,7 +62,13 @@ def _check_kanban_mode() -> bool:
         from hermes_cli.config import load_config
         cfg = load_config()
         toolsets = cfg.get("toolsets", [])
-        return "kanban" in toolsets
+        if "kanban" in toolsets:
+            return True
+        platform = os.environ.get("HERMES_SESSION_PLATFORM") or os.environ.get("HERMES_PLATFORM")
+        platform_toolsets = cfg.get("platform_toolsets", {})
+        if platform and isinstance(platform_toolsets, dict):
+            return "kanban" in (platform_toolsets.get(platform) or [])
+        return False
     except Exception:
         return False
 
@@ -183,6 +189,7 @@ def _auto_subscribe_origin_for_created_task(kb, conn, created_task_id: str, **kw
         notification_mode = "direct"
     origin_context = str(kw.get("user_task") or "").strip()[:2000] or None
     origin_profile = os.environ.get("HERMES_PROFILE") or None
+    request_id = str(kw.get("request_id") or "").strip() or None
     kb.add_notify_sub(
         conn,
         task_id=created_task_id,
@@ -194,12 +201,14 @@ def _auto_subscribe_origin_for_created_task(kb, conn, created_task_id: str, **kw
         origin_session_id=session_id or None,
         origin_profile=origin_profile,
         origin_context=origin_context,
+        request_id=request_id,
     )
     return {
         "platform": platform,
         "chat_id": chat_id,
         "thread_id": thread_id,
         "notification_mode": notification_mode,
+        "request_id": request_id,
     }
 
 
@@ -244,6 +253,7 @@ def _inherit_notify_sub_for_worker_root_task(
             origin_session_id=sub.get("origin_session_id"),
             origin_profile=sub.get("origin_profile"),
             origin_context=sub.get("origin_context"),
+            request_id=sub.get("request_id"),
         )
         if first is None:
             first = {
@@ -251,6 +261,7 @@ def _inherit_notify_sub_for_worker_root_task(
                 "chat_id": str(sub.get("chat_id") or ""),
                 "thread_id": str(sub.get("thread_id") or ""),
                 "notification_mode": notification_mode,
+                "request_id": sub.get("request_id"),
                 "inherited_from_task": current_task_id,
             }
     return first
@@ -590,6 +601,42 @@ def _handle_create(args: dict, **kw) -> str:
                     kb, conn, new_tid, list(parents),
                     requested_mode=args.get("notification_mode"),
                 )
+            try:
+                from agent.telemetry import current_turn, record_span_event
+
+                request_id = str(kw.get("request_id") or "").strip() or None
+                attrs = {
+                    "request_id": request_id,
+                    "task_id": new_tid,
+                    "kanban_task_id": new_tid,
+                    "assignee": str(assignee),
+                    "platform": str(kw.get("platform") or ""),
+                    "notification_mode": (subscription or {}).get("notification_mode"),
+                    "request_class": "async_kanban" if subscription else "kanban_created",
+                }
+                record_span_event(
+                    "kanban.task_created",
+                    platform="kanban",
+                    profile=str(assignee),
+                    attributes=attrs,
+                )
+                if subscription:
+                    record_span_event(
+                        "kanban.dispatch_ack_sent",
+                        platform="kanban",
+                        profile=str(assignee),
+                        attributes=attrs,
+                    )
+                turn = current_turn()
+                if turn is not None:
+                    turn.update_attributes(
+                        request_id=request_id,
+                        request_class="async_kanban" if subscription else "kanban_created",
+                        kanban_task_id=new_tid,
+                        notification_mode=(subscription or {}).get("notification_mode"),
+                    )
+            except Exception:
+                pass
             user_facing_status = None
             if subscription and str(subscription.get("platform") or "").lower() == "telegram":
                 user_facing_status = "I’ll look into it and report back here."

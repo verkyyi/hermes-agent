@@ -84,6 +84,16 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 
+def _record_kanban_span(name: str, **kwargs) -> None:
+    """Best-effort Kanban telemetry; never affect board state."""
+    try:
+        from agent.telemetry import record_span_event
+
+        record_span_event(name, platform="kanban", **kwargs)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -863,6 +873,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     origin_session_id TEXT,
     origin_profile    TEXT,
     origin_context    TEXT,
+    request_id        TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
@@ -1067,6 +1078,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE kanban_notify_subs ADD COLUMN origin_profile TEXT")
         if "origin_context" not in notify_cols:
             conn.execute("ALTER TABLE kanban_notify_subs ADD COLUMN origin_context TEXT")
+        if "request_id" not in notify_cols:
+            conn.execute("ALTER TABLE kanban_notify_subs ADD COLUMN request_id TEXT")
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -1650,6 +1663,27 @@ def _append_event(
     )
 
 
+def _task_correlation_attrs(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]:
+    """Low-cardinality, safe request correlation attrs for task telemetry."""
+    try:
+        rows = conn.execute(
+            "SELECT request_id, notification_mode, platform "
+            "FROM kanban_notify_subs WHERE task_id = ? ORDER BY created_at ASC",
+            (task_id,),
+        ).fetchall()
+    except Exception:
+        rows = []
+    out: dict[str, Any] = {"task_id": task_id}
+    for row in rows:
+        if row["request_id"] and not out.get("request_id"):
+            out["request_id"] = row["request_id"]
+        if row["notification_mode"] and not out.get("notification_mode"):
+            out["notification_mode"] = row["notification_mode"]
+        if row["platform"] and not out.get("platform"):
+            out["platform"] = row["platform"]
+    return out
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2205,9 +2239,101 @@ _SECRETISH_RE = re.compile(
     r"(?i)(api[_-]?key|token|secret|password|authorization)(\s*[:=]\s*)([^\s'\"]{8,})"
 )
 
+_PROVIDER_REFUSAL_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("provider safety filter flagged possible cybersecurity risk", r"flagged for possible cybersecurity risk"),
+    ("provider policy blocked cybersecurity-adjacent content", r"cybersecurity risk"),
+    ("provider content policy refusal", r"content (?:was )?(?:blocked|flagged|rejected)|content[_ -]?policy"),
+    ("model safety refusal", r"\b(?:i can(?:not|'t)|i'?m unable to)\b.*\b(?:cyber|security|hacking|exploit)"),
+    ("provider safety refusal", r"\b(?:safety|policy)\b.*\b(?:refus(?:al|ed|e)|blocked|filter)"),
+)
+
+_MODEL_API_ERROR_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("provider rate limit or quota exhausted", r"rate limit|insufficient[_ -]?quota|quota exceeded|billing hard limit"),
+    ("provider authentication or authorization failure", r"401|403|unauthorized|forbidden|missing authentication"),
+    ("provider API unavailable", r"5\d\d server error|service unavailable|overloaded|upstream error"),
+)
+
 
 def _redact_diagnostic_text(text: str) -> str:
     return _SECRETISH_RE.sub(r"\1\2[redacted]", text or "")
+
+
+def _first_matching_line(text: str, pattern: str) -> str:
+    regex = re.compile(pattern, re.IGNORECASE | re.DOTALL)
+    for line in (text or "").splitlines():
+        if regex.search(line):
+            return line.strip()[:400]
+    match = regex.search(text or "")
+    if not match:
+        return ""
+    start = max(0, match.start() - 120)
+    end = min(len(text), match.end() + 120)
+    return (text[start:end].replace("\n", " ").strip())[:400]
+
+
+def _extract_provider_model(text: str) -> dict[str, str]:
+    """Best-effort provider/model extraction from a redacted worker log tail."""
+    out: dict[str, str] = {}
+    for line in (text or "").splitlines():
+        lower = line.lower()
+        if "provider" in lower and "provider" not in out:
+            m = re.search(r"(?i)provider\s*[:=]\s*([^\s,;]+)", line)
+            if m:
+                out["provider"] = m.group(1).strip()[:80]
+        if "model" in lower and "model" not in out:
+            m = re.search(r"(?i)model\s*[:=]\s*([^\s,;]+)", line)
+            if m:
+                out["model"] = m.group(1).strip()[:120]
+    return out
+
+
+def classify_model_provider_failure(text: str) -> Optional[dict[str, Any]]:
+    """Classify known provider/API failures from bounded worker log text.
+
+    This is intentionally conservative: only recognizable provider safety,
+    quota, auth, or upstream API failures are promoted out of the generic
+    clean-exit/protocol-violation bucket. Returned values are safe for
+    durable task metadata: diagnostics are redacted and capped.
+    """
+    redacted = _redact_diagnostic_text(text or "")
+    if not redacted.strip():
+        return None
+    for label, pattern in _PROVIDER_REFUSAL_PATTERNS:
+        if re.search(pattern, redacted, re.IGNORECASE | re.DOTALL):
+            evidence = _first_matching_line(redacted, pattern)
+            info: dict[str, Any] = {
+                "failure_class": "model_api_error",
+                "failure_subtype": "blocked_provider_policy",
+                "provider_failure_kind": "provider_refusal",
+                "provider_failure_label": label,
+                "evidence": evidence,
+                "public_message": (
+                    "The worker was blocked by the model provider's safety/filter/API policy "
+                    "during an authorized defensive/security-adjacent operation. Route the "
+                    "task to an ops/security-capable profile with a suitable provider/model, "
+                    "or block early if none is configured."
+                ),
+            }
+            info.update(_extract_provider_model(redacted))
+            return info
+    for label, pattern in _MODEL_API_ERROR_PATTERNS:
+        if re.search(pattern, redacted, re.IGNORECASE | re.DOTALL):
+            evidence = _first_matching_line(redacted, pattern)
+            info = {
+                "failure_class": "model_api_error",
+                "failure_subtype": "provider_api_failure",
+                "provider_failure_kind": "model_api_error",
+                "provider_failure_label": label,
+                "evidence": evidence,
+                "public_message": (
+                    "The worker was stopped by a model provider/API failure, not by Kanban "
+                    "lifecycle logic. Check provider credentials/quota/routing or assign a "
+                    "profile with a working provider."
+                ),
+            }
+            info.update(_extract_provider_model(redacted))
+            return info
+    return None
 
 
 def failure_diagnostics(
@@ -2466,6 +2592,27 @@ def complete_task(
                 summary=summary if summary is not None else result,
                 metadata=metadata,
             )
+        try:
+            if run_id is not None:
+                run_row = conn.execute(
+                    "SELECT profile, started_at, outcome, status FROM task_runs WHERE id = ?",
+                    (run_id,),
+                ).fetchone()
+                if run_row and run_row["started_at"]:
+                    _record_kanban_span(
+                        "worker.run",
+                        profile=run_row["profile"] or "",
+                        started_at_ms=int(run_row["started_at"]) * 1000,
+                        ended_at_ms=now * 1000,
+                        attributes={
+                            **_task_correlation_attrs(conn, task_id),
+                            "task_status": "done",
+                            "profile": run_row["profile"] or "",
+                            "outcome": run_row["outcome"] or "completed",
+                        },
+                    )
+        except Exception:
+            pass
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
         # second SQL round-trip. First line only, 400 char cap — the
@@ -3295,8 +3442,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # write_txn so can't nest). ``protocol_violation`` flags the
     # clean-exit-but-still-running case so we can trip the breaker
     # immediately instead of incrementing by 1.
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[dict[str, Any]] = []
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock FROM tasks "
@@ -3313,24 +3459,57 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
+            diag = failure_diagnostics(conn, row["id"])
+            provider_failure = classify_model_provider_failure(
+                str(diag.get("worker_log_tail") or "")
+            )
             if kind == "clean_exit":
-                # Worker subprocess returned 0 but its task is still
-                # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Retrying won't
-                # help.
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation"
-                )
-                event_kind = "protocol_violation"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                }
+                if provider_failure:
+                    # Worker returned rc=0 without a lifecycle transition, but
+                    # the log tail shows a provider/API refusal. Surface the
+                    # real blocker instead of collapsing it into a generic
+                    # protocol violation.
+                    protocol_violation = False
+                    run_outcome = provider_failure.get("provider_failure_kind") or "model_api_error"
+                    error_text = (
+                        f"{provider_failure.get('failure_subtype', 'model_api_error')}: "
+                        f"{provider_failure.get('provider_failure_label', 'provider/model API failure')}"
+                    )
+                    if provider_failure.get("provider"):
+                        error_text += f" provider={provider_failure['provider']}"
+                    if provider_failure.get("model"):
+                        error_text += f" model={provider_failure['model']}"
+                    event_kind = str(run_outcome)
+                    event_payload = {
+                        "pid": pid,
+                        "claimer": row["claim_lock"],
+                        "exit_kind": kind,
+                        "exit_code": code,
+                        **provider_failure,
+                    }
+                    failure_limit_override = 1
+                else:
+                    # Worker subprocess returned 0 but its task is still
+                    # ``running`` in the DB — it exited without calling
+                    # ``kanban_complete`` / ``kanban_block``. Retrying won't
+                    # help.
+                    protocol_violation = True
+                    run_outcome = "crashed"
+                    error_text = (
+                        "worker exited cleanly (rc=0) without calling "
+                        "kanban_complete or kanban_block — protocol violation"
+                    )
+                    event_kind = "protocol_violation"
+                    event_payload = {
+                        "pid": pid,
+                        "claimer": row["claim_lock"],
+                        "exit_code": code,
+                    }
+                    failure_limit_override = 1
             else:
                 protocol_violation = False
+                run_outcome = "crashed"
+                failure_limit_override = None
                 if kind == "nonzero_exit":
                     error_text = f"pid {pid} exited with code {code}"
                 elif kind == "signaled":
@@ -3343,7 +3522,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
-            diag = failure_diagnostics(conn, row["id"])
             if diag:
                 event_payload.update(diag)
 
@@ -3356,7 +3534,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             if cur.rowcount == 1:
                 run_id = _end_run(
                     conn, row["id"],
-                    outcome="crashed", status="crashed",
+                    outcome=str(run_outcome), status="failed" if run_outcome != "crashed" else "crashed",
                     error=error_text,
                     metadata=dict(event_payload),
                 )
@@ -3366,10 +3544,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     run_id=run_id,
                 )
                 crashed.append(row["id"])
-                crash_details.append(
-                    (row["id"], pid, row["claim_lock"],
-                     protocol_violation, error_text)
-                )
+                crash_details.append({
+                    "task_id": row["id"],
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "protocol_violation": protocol_violation,
+                    "error_text": error_text,
+                    "outcome": str(run_outcome),
+                    "failure_limit": failure_limit_override,
+                    "provider_failure": provider_failure or {},
+                })
     # Outside the main txn: increment the unified failure counter for
     # each crashed task. If the breaker trips, the task transitions
     # ready → blocked with a ``gave_up`` event on top of the ``crashed``
@@ -3381,17 +3565,23 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # human with a clear reason than to loop ``DEFAULT_FAILURE_LIMIT``
     # times first.
     auto_blocked: list[str] = []
-    for tid, pid, claimer, protocol_violation, error_text in crash_details:
+    for detail in crash_details:
+        tid = str(detail["task_id"])
+        pid = int(detail["pid"])
+        claimer = str(detail.get("claimer") or "")
+        error_text = str(detail["error_text"])
+        outcome = str(detail.get("outcome") or "crashed")
         tripped = _record_task_failure(
             conn, tid,
             error=error_text,
-            outcome="crashed",
-            failure_limit=(1 if protocol_violation else None),
+            outcome=outcome,
+            failure_limit=detail.get("failure_limit"),
             release_claim=False,
             end_run=False,
             event_payload_extra={
                 "pid": pid,
                 "claimer": claimer,
+                **(detail.get("provider_failure") or {}),
                 **failure_diagnostics(conn, tid),
             },
         )
@@ -3663,13 +3853,137 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _forced_skill_identifiers(task: Task) -> list[str]:
+    """Return the built-in + per-task forced skills, deduped in load order."""
+    identifiers: list[str] = []
+    seen: set[str] = set()
+    for sk in ["kanban-worker", *(task.skills or [])]:
+        if sk and sk not in seen:
+            identifiers.append(sk)
+            seen.add(sk)
+    return identifiers
+
+
+def _resolve_forced_skill_args(
+    profile: str,
+    identifiers: list[str],
+    *,
+    task_id: str | None = None,
+) -> tuple[list[str], list[str], list[str], dict[str, str]]:
+    """Resolve forced skills for a target profile.
+
+    The first pass uses the target profile exactly as the worker CLI will see
+    it.  If that misses, fall back to the default Hermes skills directory and
+    return absolute skill paths for those skills.  This keeps explicit Kanban
+    orchestration from being constrained by a worker profile's ambient skill
+    index/allowlist while still preserving hard denial: the final validation
+    below reloads every resolved argument under the worker profile, so
+    ``skills.disabled`` / ``platform_disabled`` still reject the skill.
+    """
+    from hermes_cli.profiles import get_profile_dir
+    from agent.skill_commands import build_preloaded_skills_prompt
+
+    def _with_profile_home(home: Path, fn):
+        old_home = os.environ.get("HERMES_HOME")
+        old_profile = os.environ.get("HERMES_PROFILE")
+        patched_skills_tool = None
+        old_skills_home = None
+        old_skills_dir = None
+        try:
+            os.environ["HERMES_HOME"] = str(home)
+            os.environ["HERMES_PROFILE"] = profile
+
+            # ``tools.skills_tool`` caches HERMES_HOME/SKILLS_DIR at import time.
+            # The gateway dispatcher usually imported it under the default
+            # profile long before this preflight runs, so changing the env alone
+            # is not enough to answer "would the target worker profile load this
+            # named skill?".  Patch the module-level paths for the duration of
+            # the probe; dynamic config lookups still read the profile's
+            # config.yaml via hermes_constants.get_hermes_home().
+            try:
+                import tools.skills_tool as _skills_tool  # type: ignore
+                patched_skills_tool = _skills_tool
+                old_skills_home = getattr(_skills_tool, "HERMES_HOME", None)
+                old_skills_dir = getattr(_skills_tool, "SKILLS_DIR", None)
+                _skills_tool.HERMES_HOME = home
+                _skills_tool.SKILLS_DIR = home / "skills"
+            except Exception:
+                patched_skills_tool = None
+
+            return fn()
+        finally:
+            if patched_skills_tool is not None:
+                try:
+                    patched_skills_tool.HERMES_HOME = old_skills_home
+                    patched_skills_tool.SKILLS_DIR = old_skills_dir
+                except Exception:
+                    pass
+            if old_home is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = old_home
+            if old_profile is None:
+                os.environ.pop("HERMES_PROFILE", None)
+            else:
+                os.environ["HERMES_PROFILE"] = old_profile
+
+    profile_home = get_profile_dir(profile)
+
+    _prompt, loaded, missing = _with_profile_home(
+        profile_home,
+        lambda: build_preloaded_skills_prompt(identifiers, task_id=task_id),
+    )
+    if not missing:
+        return identifiers, loaded, [], {}
+
+    # Named profiles are intentionally isolated, but Kanban forced skills are
+    # explicit orchestration requests.  If the skill exists in the default
+    # profile's shared skill store, pass the absolute path to the worker CLI so
+    # it can load it without adding that skill to the worker's ambient index.
+    from hermes_constants import get_default_hermes_root
+    default_home = get_default_hermes_root()
+    default_skills_dir = default_home / "skills"
+    resolved_map: dict[str, str] = {}
+    for ident in missing:
+        raw = (ident or "").strip()
+        if not raw or os.path.isabs(raw):
+            continue
+        direct = default_skills_dir / raw
+        if direct.is_dir() and (direct / "SKILL.md").exists():
+            resolved_map[ident] = str(direct)
+            continue
+        if direct.with_suffix(".md").exists():
+            resolved_map[ident] = str(direct.with_suffix(".md"))
+            continue
+        try:
+            from agent.skill_utils import iter_skill_index_files
+            for found_skill_md in iter_skill_index_files(default_skills_dir, "SKILL.md"):
+                if found_skill_md.parent.name == raw:
+                    resolved_map[ident] = str(found_skill_md.parent)
+                    break
+        except Exception:
+            pass
+
+    resolved_args = [resolved_map.get(ident, ident) for ident in identifiers]
+    _prompt, loaded, final_missing = _with_profile_home(
+        profile_home,
+        lambda: build_preloaded_skills_prompt(resolved_args, task_id=task_id),
+    )
+    # ``build_preloaded_skills_prompt`` reports the exact argv identifier that
+    # failed.  For default-profile fallbacks that may be an absolute path; map it
+    # back to the task author's original skill name so preflight/block messages
+    # are actionable and not tied to host-local paths.
+    reverse_resolved = {v: k for k, v in resolved_map.items()}
+    display_missing = [reverse_resolved.get(m, m) for m in final_missing]
+    return resolved_args, loaded, display_missing, resolved_map
+
+
 def _preflight_task_skills(task: Task) -> Optional[dict[str, Any]]:
     """Validate forced task skills against the target profile before spawn."""
     if not task.skills:
         return None
     try:
-        from hermes_cli.profiles import get_profile_dir, normalize_profile_name
-        from agent.skill_commands import build_preloaded_skills_prompt
+        from hermes_cli.profiles import normalize_profile_name
     except Exception as exc:
         return {
             "preflight": "skills",
@@ -3677,34 +3991,26 @@ def _preflight_task_skills(task: Task) -> Optional[dict[str, Any]]:
             "error": f"skill preflight unavailable: {exc}",
         }
     profile = normalize_profile_name(task.assignee or "")
-    identifiers: list[str] = []
-    seen: set[str] = set()
-    for sk in ["kanban-worker", *(task.skills or [])]:
-        if sk and sk not in seen:
-            identifiers.append(sk)
-            seen.add(sk)
-    old_home = os.environ.get("HERMES_HOME")
-    old_profile = os.environ.get("HERMES_PROFILE")
     try:
-        os.environ["HERMES_HOME"] = str(get_profile_dir(profile))
-        os.environ["HERMES_PROFILE"] = profile
-        _prompt, loaded, missing = build_preloaded_skills_prompt(
-            identifiers, task_id=task.id
+        identifiers = _forced_skill_identifiers(task)
+        resolved_args, loaded, missing, resolved_map = _resolve_forced_skill_args(
+            profile,
+            identifiers,
+            task_id=task.id,
         )
-    finally:
-        if old_home is None:
-            os.environ.pop("HERMES_HOME", None)
-        else:
-            os.environ["HERMES_HOME"] = old_home
-        if old_profile is None:
-            os.environ.pop("HERMES_PROFILE", None)
-        else:
-            os.environ["HERMES_PROFILE"] = old_profile
+    except Exception as exc:
+        return {
+            "preflight": "skills",
+            "profile": profile,
+            "error": f"skill preflight unavailable: {exc}",
+        }
     if missing:
         return {
             "preflight": "skills",
             "profile": profile,
             "forced_skills": identifiers,
+            "resolved_skill_args": resolved_args,
+            "default_profile_resolutions": resolved_map,
             "loaded_skills": loaded,
             "missing_skills": missing,
             "error": f"Unknown skill(s): {', '.join(missing)} for profile {profile}",
@@ -3823,6 +4129,22 @@ def dispatch_once(
         if claimed is None:
             continue
         try:
+            if claimed.created_at:
+                now_ms = int(time.time() * 1000)
+                _record_kanban_span(
+                    "queue.wait",
+                    profile=claimed.assignee or "",
+                    started_at_ms=int(claimed.created_at) * 1000,
+                    ended_at_ms=now_ms,
+                    attributes={
+                        **_task_correlation_attrs(conn, claimed.id),
+                        "task_status": "claimed",
+                        "profile": claimed.assignee or "",
+                    },
+                )
+        except Exception:
+            pass
+        try:
             workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
             auto = _record_spawn_failure(
@@ -3840,7 +4162,7 @@ def dispatch_once(
                 conn,
                 claimed.id,
                 preflight.get("error") or "forced skill preflight failed",
-                failure_limit=failure_limit,
+                failure_limit=1,
                 event_payload_extra=preflight,
             )
             if auto:
@@ -3852,6 +4174,9 @@ def dispatch_once(
             # (task, workspace). Test stubs in the suite rely on that.
             # Introspect the callable and pass `board` only when supported.
             import inspect
+            _spawn_started = time.monotonic()
+            _spawn_status = "ok"
+            _spawn_error = None
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
@@ -3860,6 +4185,23 @@ def dispatch_once(
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
+            except Exception as exc:
+                _spawn_status = "error"
+                _spawn_error = str(exc)
+                raise
+            finally:
+                _record_kanban_span(
+                    "worker.spawn",
+                    profile=claimed.assignee or "",
+                    duration_ms=(time.monotonic() - _spawn_started) * 1000,
+                    status=_spawn_status,
+                    error=_spawn_error,
+                    attributes={
+                        **_task_correlation_attrs(conn, claimed.id),
+                        "task_status": "running" if _spawn_status == "ok" else "spawn_failed",
+                        "profile": claimed.assignee or "",
+                    },
+                )
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # NOTE: we intentionally do NOT reset consecutive_failures
@@ -3963,18 +4305,35 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    resolved_skill_args = _forced_skill_identifiers(task)
+    if task.skills:
+        try:
+            resolved_skill_args, _loaded, missing, _resolved_map = _resolve_forced_skill_args(
+                profile_arg,
+                resolved_skill_args,
+                task_id=task.id,
+            )
+            if missing:
+                raise ValueError(
+                    f"Unknown skill(s): {', '.join(missing)} for profile {profile_arg}"
+                )
+        except Exception:
+            # dispatch_once runs the same validation before calling _default_spawn.
+            # If a direct/test caller bypasses dispatch_once, preserve the old
+            # transparent argv behavior rather than hiding the task skill names.
+            resolved_skill_args = _forced_skill_identifiers(task)
+
     cmd = [
         "hermes",
         "-p", profile_arg,
         # Auto-load the kanban-worker skill so every dispatched worker
         # has the pattern library (good summary/metadata shapes, retry
         # diagnostics, block-reason examples) in its context, even if
-        # the profile hasn't wired it into skills config. The MANDATORY
-        # lifecycle is already in the system prompt via KANBAN_GUIDANCE;
-        # this skill is the deeper reference. Users can point a profile
-        # at a different/additional skill via config if they want —
-        # --skills is additive to the profile's default skill set.
-        "--skills", "kanban-worker",
+        # the profile hasn't wired it into its default skills config.
+        # When a task has forced skills, preflight may resolve this to an
+        # absolute default-profile skill path so named profiles can still load
+        # the built-in without broadening their ambient skill index.
+        "--skills", resolved_skill_args[0] if resolved_skill_args else "kanban-worker",
     ]
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI
@@ -3983,10 +4342,9 @@ def _default_spawn(
     # quoting ambiguity if a skill name ever contains unusual chars.
     # Dedupe against the built-in so we don't double-load kanban-worker
     # if a task author asks for it explicitly.
-    if task.skills:
-        for sk in task.skills:
-            if sk and sk != "kanban-worker":
-                cmd.extend(["--skills", sk])
+    for sk in resolved_skill_args[1:]:
+        if sk and sk != resolved_skill_args[0]:
+            cmd.extend(["--skills", sk])
     cmd.extend([
         "chat",
         "-q", prompt,
@@ -4352,6 +4710,7 @@ def add_notify_sub(
     origin_session_id: Optional[str] = None,
     origin_profile: Optional[str] = None,
     origin_context: Optional[str] = None,
+    request_id: Optional[str] = None,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread)."""
@@ -4363,12 +4722,12 @@ def add_notify_sub(
             INSERT OR IGNORE INTO kanban_notify_subs
                 (task_id, platform, chat_id, thread_id, user_id,
                  notification_mode, origin_session_id, origin_profile,
-                 origin_context, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 origin_context, request_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id, platform, chat_id, thread_id or "", user_id,
-                mode, origin_session_id, origin_profile, origin_context, now,
+                mode, origin_session_id, origin_profile, origin_context, request_id, now,
             ),
         )
 

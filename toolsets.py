@@ -232,6 +232,19 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "agentfeeds_readonly": {
+        "description": (
+            "Read-only AgentFeeds access for front-desk profiles: health, "
+            "stream discovery, stream reads, and cached-state search. No "
+            "subscription, refresh, secrets, writes, shell, or raw file access."
+        ),
+        "tools": [
+            "agentfeeds_health", "agentfeeds_streams_find",
+            "agentfeeds_stream_read", "agentfeeds_search",
+        ],
+        "includes": [],
+    },
+
     "discord": {
         "description": "Discord read and participate tools (fetch messages, search members, create threads)",
         "tools": ["discord"],

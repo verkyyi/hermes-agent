@@ -48,7 +48,7 @@ from tools.code_execution_tool import (
 )
 
 
-def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):
+def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None, **kwargs):
     """Mock dispatcher that returns canned responses for each tool."""
     if function_name == "terminal":
         cmd = function_args.get("command", "")
@@ -218,6 +218,33 @@ print(result.get("output", ""))
         self.assertIn("mock output for: echo hello", result["output"])
         self.assertEqual(result["tool_calls_made"], 1)
 
+    def test_nested_tool_call_preserves_request_id(self):
+        """execute_code RPC calls should keep the foreground request id."""
+        code = """
+from hermes_tools import terminal
+terminal("echo hello")
+"""
+        seen = []
+
+        def capture(function_name, function_args, task_id=None, user_task=None, **kwargs):
+            seen.append((function_name, task_id, kwargs.get("request_id")))
+            return _mock_handle_function_call(
+                function_name, function_args, task_id=task_id,
+                user_task=user_task, **kwargs
+            )
+
+        with patch("model_tools.handle_function_call", side_effect=capture):
+            result = execute_code(
+                code=code,
+                task_id="test-task",
+                request_id="req-123",
+                enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
+            )
+
+        parsed = json.loads(result)
+        self.assertEqual(parsed["status"], "success", parsed)
+        self.assertEqual(seen, [("terminal", "test-task", "req-123")])
+
     def test_multi_tool_chain(self):
         """Script calls multiple tools sequentially."""
         code = """
@@ -277,7 +304,7 @@ else:
     print(f"OK {N}/{N}")
 '''
 
-        def slow_mock(function_name, function_args, task_id=None, user_task=None):
+        def slow_mock(function_name, function_args, task_id=None, user_task=None, **kwargs):
             import time as _t
             if function_name == "terminal":
                 _t.sleep(0.05)  # ensure requests overlap on the socket
@@ -286,7 +313,8 @@ else:
                 out = cmd[5:] if cmd.startswith("echo ") else f"mock: {cmd}"
                 return json.dumps({"output": out, "exit_code": 0})
             return _mock_handle_function_call(
-                function_name, function_args, task_id=task_id, user_task=user_task
+                function_name, function_args, task_id=task_id,
+                user_task=user_task, **kwargs
             )
 
         with patch("model_tools.handle_function_call", side_effect=slow_mock):

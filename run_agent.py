@@ -33,6 +33,7 @@ import os
 import random
 import re
 import ssl
+import subprocess
 import sys
 import tempfile
 import time
@@ -58,6 +59,153 @@ from datetime import datetime
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+
+
+def _agentfeeds_cache_root() -> Path:
+    """Return the AgentFeeds cache root used for prompt inventory discovery."""
+
+    return Path(os.environ.get("AGENTFEEDS_ROOT", Path.home() / ".agentfeeds")).expanduser()
+
+
+def _agentfeeds_group_for_stream_id(stream_id: str) -> str:
+    if "/" in stream_id:
+        group, _name = stream_id.split("/", 1)
+        return group or "streams"
+    return "streams"
+
+
+def _agentfeeds_name_for_stream_id(stream_id: str) -> str:
+    if "/" in stream_id:
+        _group, name = stream_id.split("/", 1)
+        return name or stream_id
+    return stream_id
+
+
+def _agentfeeds_subscription_ids_from_yaml(path: Path) -> list[str]:
+    """Best-effort subscription id parser without adding a YAML dependency."""
+
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+
+    ids: list[str] = []
+    in_subscriptions = False
+    current: str | None = None
+    for line in lines:
+        if line.strip() == "subscriptions:":
+            in_subscriptions = True
+            continue
+        if not in_subscriptions:
+            continue
+        stripped = line.lstrip()
+        if stripped.startswith("- "):
+            if current:
+                ids.append(current)
+            current = None
+            item = stripped[2:].strip()
+            if item.startswith("id:"):
+                current = item.split(":", 1)[1].strip().strip('"\'')
+            continue
+        if current is None and line.startswith(("  ", "    ")) and stripped.startswith("id:"):
+            current = stripped.split(":", 1)[1].strip().strip('"\'')
+    if current:
+        ids.append(current)
+    return [stream_id for stream_id in ids if stream_id]
+
+
+def _agentfeeds_subscription_ids_from_state(root: Path) -> list[str]:
+    state_root = root / "state"
+    if not state_root.exists():
+        return []
+    ids: list[str] = []
+    for path in sorted(state_root.glob("**/*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        meta = payload.get("_meta") if isinstance(payload.get("_meta"), dict) else {}
+        stream_id = meta.get("subscription_id")
+        if stream_id:
+            ids.append(str(stream_id))
+    return ids
+
+
+def _render_agentfeeds_manifest(stream_ids: list[str], max_per_group: int) -> str | None:
+    seen: set[str] = set()
+    grouped: dict[str, list[str]] = {}
+    for raw_stream_id in stream_ids:
+        stream_id = str(raw_stream_id).strip()
+        if not stream_id or stream_id in seen:
+            continue
+        seen.add(stream_id)
+        group = _agentfeeds_group_for_stream_id(stream_id)
+        name = _agentfeeds_name_for_stream_id(stream_id)
+        grouped.setdefault(group, []).append(name)
+    if not grouped:
+        return None
+
+    cap = max(1, int(max_per_group or 12))
+    lines = [
+        "<agentfeeds>",
+        "Available local streams by group. Prefer relevant streams before web/API calls or asking again.",
+    ]
+    for group, names in grouped.items():
+        shown = names[:cap]
+        suffix = f", ... (+{len(names) - cap} more)" if len(names) > cap else ""
+        lines.append(f"- {group}: {', '.join(shown)}{suffix}")
+    lines.append("</agentfeeds>")
+    return "\n".join(lines)
+
+
+def _build_agentfeeds_system_manifest(config: dict[str, Any] | None = None) -> str | None:
+    """Build a stable AgentFeeds stream inventory for the cached system prompt.
+
+    This intentionally excludes health, freshness, stale counts, timestamps,
+    unread counts, prices, weather values, and other volatile stream content.
+    Failures are ignored so AgentFeeds can never block normal agent startup.
+    """
+
+    try:
+        cfg = (config or {}).get("agentfeeds", {})
+        sys_cfg = cfg.get("system_prompt", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(sys_cfg, dict) or not sys_cfg.get("enabled", False):
+            return None
+        timeout = float(sys_cfg.get("timeout_seconds", 1.0) or 1.0)
+        max_per_group = int(sys_cfg.get("max_per_group", 12) or 12)
+        root = _agentfeeds_cache_root()
+
+        # Prefer AgentFeeds' own stream ordering when the CLI is available, but
+        # render our own manifest so the system prompt remains strictly stable.
+        cli = os.environ.get("AGENTFEEDS_CLI", "agentfeeds")
+        stream_ids: list[str] = []
+        try:
+            result = subprocess.run(
+                [cli, "--root", str(root), "brief", "--json"],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=max(0.1, timeout),
+            )
+            if result.returncode == 0:
+                payload = json.loads(result.stdout)
+                streams = payload.get("streams") if isinstance(payload, dict) else None
+                if isinstance(streams, list):
+                    stream_ids = [str(row.get("id")) for row in streams if isinstance(row, dict) and row.get("id")]
+        except Exception:
+            stream_ids = []
+
+        if not stream_ids:
+            stream_ids = _agentfeeds_subscription_ids_from_yaml(root / "subscriptions.yaml")
+        if not stream_ids:
+            stream_ids = _agentfeeds_subscription_ids_from_state(root)
+        return _render_agentfeeds_manifest(stream_ids, max_per_group)
+    except Exception:
+        return None
 
 
 _OPENAI_CLS_CACHE: Optional[type] = None
@@ -151,6 +299,7 @@ from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.telemetry import begin_turn_safe, current_turn
 from agent.codex_responses_adapter import (
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
     _deterministic_call_id as _codex_deterministic_call_id,
@@ -1724,10 +1873,16 @@ class AIAgent:
             )
         except Exception as _tlg_err:
             logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
-        # Cache only the derived auxiliary compression context override that is
-        # needed later by the startup feasibility check.  Avoid exposing a
-        # broad pseudo-public config object on the agent instance.
+        # Cache only narrowly scoped config values needed later. Avoid exposing
+        # a broad pseudo-public config object on the agent instance.
         self._aux_compression_context_length_config = None
+        _agentfeeds_cfg = _agent_cfg.get("agentfeeds", {}) if isinstance(_agent_cfg, dict) else {}
+        if not isinstance(_agentfeeds_cfg, dict):
+            _agentfeeds_cfg = {}
+        _agentfeeds_system_cfg = _agentfeeds_cfg.get("system_prompt", {})
+        self._agentfeeds_system_prompt_config = (
+            _agentfeeds_system_cfg if isinstance(_agentfeeds_system_cfg, dict) else {}
+        )
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -2623,6 +2778,12 @@ class AIAgent:
         except Exception:
             pass
         if self.status_callback:
+            try:
+                turn = current_turn()
+                if turn is not None:
+                    turn.mark_ack()
+            except Exception:
+                pass
             try:
                 self.status_callback("lifecycle", message)
             except Exception:
@@ -5219,6 +5380,16 @@ class AIAgent:
             except Exception:
                 pass
 
+        # Stable AgentFeeds inventory. This lives in shared system-prompt
+        # assembly so CLI, gateway, cron, and worker sessions all get the same
+        # cached-prefix stream manifest when enabled. It deliberately excludes
+        # volatile freshness/health/content; plugins may inject those per turn.
+        _agentfeeds_manifest = _build_agentfeeds_system_manifest(
+            {"agentfeeds": {"system_prompt": getattr(self, "_agentfeeds_system_prompt_config", {})}}
+        )
+        if _agentfeeds_manifest:
+            prompt_parts.append(_agentfeeds_manifest)
+
         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
         if has_skills_tools:
             avail_toolsets = {
@@ -6928,6 +7099,12 @@ class AIAgent:
                 text = text.lstrip("\n")
         if not text:
             return
+        try:
+            turn = current_turn()
+            if turn is not None:
+                turn.mark_output(text)
+        except Exception:
+            pass
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
         delivered = False
         for cb in callbacks:
@@ -9750,6 +9927,7 @@ class AIAgent:
                 chat_id=self._chat_id or "",
                 thread_id=self._thread_id or "",
                 user_id=self._user_id or "",
+                request_id=(getattr(current_turn(), "id", "") if current_turn() is not None else ""),
                 user_task=getattr(self, "_current_user_message_for_tools", ""),
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
@@ -9952,6 +10130,21 @@ class AIAgent:
                 except Exception:
                     pass
             start = time.time()
+            _telemetry_turn = current_turn()
+            _tool_span = None
+            try:
+                if _telemetry_turn is not None:
+                    _tool_span = _telemetry_turn.start_span(
+                        "tool.call",
+                        tool_name=function_name,
+                        concurrent=True,
+                        api_call_count=api_call_count,
+                    )
+                    _tool_span.__enter__()
+                    _telemetry_turn.increment_tool_count(1)
+                    _telemetry_turn.mark_side_effect()
+            except Exception:
+                _tool_span = None
             try:
                 result = self._invoke_tool(
                     function_name,
@@ -9966,6 +10159,16 @@ class AIAgent:
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
+            try:
+                if _tool_span is not None:
+                    _tool_span.finish(
+                        status="error" if is_error else "ok",
+                        duration_s=duration,
+                        result_chars=len(result or ""),
+                    )
+                    _tool_span.__exit__(None, None, None)
+            except Exception:
+                pass
             if is_error:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
@@ -10282,6 +10485,23 @@ class AIAgent:
                     pass  # never block tool execution
 
             tool_start_time = time.time()
+            _telemetry_turn = current_turn()
+            _tool_span = None
+            try:
+                if _telemetry_turn is not None:
+                    _tool_span = _telemetry_turn.start_span(
+                        "tool.call",
+                        tool_name=function_name,
+                        concurrent=False,
+                        api_call_count=api_call_count,
+                        blocked=_execution_blocked,
+                    )
+                    _tool_span.__enter__()
+                    if not _execution_blocked:
+                        _telemetry_turn.increment_tool_count(1)
+                        _telemetry_turn.mark_side_effect()
+            except Exception:
+                _tool_span = None
 
             if _block_msg is not None:
                 # Tool blocked by plugin policy — return error without executing.
@@ -10444,6 +10664,7 @@ class AIAgent:
                         chat_id=self._chat_id or "",
                         thread_id=self._thread_id or "",
                         user_id=self._user_id or "",
+                        request_id=(getattr(current_turn(), "id", "") if current_turn() is not None else ""),
                         user_task=getattr(self, "_current_user_message_for_tools", ""),
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
@@ -10469,6 +10690,7 @@ class AIAgent:
                         chat_id=self._chat_id or "",
                         thread_id=self._thread_id or "",
                         user_id=self._user_id or "",
+                        request_id=(getattr(current_turn(), "id", "") if current_turn() is not None else ""),
                         user_task=getattr(self, "_current_user_message_for_tools", ""),
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
@@ -10485,6 +10707,15 @@ class AIAgent:
             # Log tool errors to the persistent error log so [error] tags
             # in the UI always have a corresponding detailed entry on disk.
             _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+            try:
+                _tool_span.finish(
+                    status="error" if _is_error_result else "ok",
+                    duration_s=tool_duration,
+                    result_chars=len(function_result or ""),
+                )
+                _tool_span.__exit__(None, None, None)
+            except Exception:
+                pass
             if not _execution_blocked:
                 function_result = self._append_guardrail_observation(
                     function_name,
@@ -10848,6 +11079,21 @@ class AIAgent:
         self._persist_user_message_override = persist_user_message
         # Generate unique task_id if not provided to isolate VMs between concurrent tasks
         effective_task_id = task_id or str(uuid.uuid4())
+        _telemetry_turn = begin_turn_safe(
+            session_id=self.session_id or "",
+            platform=self.platform or "cli",
+            profile=os.getenv("HERMES_PROFILE", ""),
+            model=self.model or "",
+            provider=self.provider or "",
+            attributes={
+                "task_id": effective_task_id,
+                "gateway_request_id": getattr(self, "gateway_request_id", ""),
+                "tool_schema_count": len(self.tools or []),
+                "history_count": len(conversation_history or []),
+                "api_mode": self.api_mode,
+                "streaming_requested": bool(stream_callback or self.stream_delta_callback),
+            },
+        )
         # Expose the active task_id so tools running mid-turn (e.g. delegate_task
         # in delegate_tool.py) can identify this agent for the cross-agent file
         # state registry.  Set BEFORE any tool dispatch so snapshots taken at
@@ -10906,6 +11152,17 @@ class AIAgent:
         )
 
         # Initialize conversation (copy to avoid mutating the caller's list)
+        _context_span = None
+        try:
+            _turn_for_context = locals().get("_telemetry_turn") or current_turn()
+            if _turn_for_context is not None:
+                _context_span = _turn_for_context.start_span(
+                    "context.assembly",
+                    history_count=len(conversation_history or []),
+                )
+                _context_span.__enter__()
+        except Exception:
+            _context_span = None
         messages = list(conversation_history) if conversation_history else []
 
         # Hydrate todo store from conversation history (gateway creates a fresh
@@ -11164,6 +11421,12 @@ class AIAgent:
                 _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
             except Exception:
                 pass
+
+        try:
+            _context_span.finish(status="ok", approx_tokens=_preflight_tokens if '_preflight_tokens' in locals() else None)
+            _context_span.__exit__(None, None, None)
+        except Exception:
+            pass
 
         while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
@@ -11477,6 +11740,22 @@ class AIAgent:
                 logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
             
             api_start_time = time.time()
+            _api_span = None
+            try:
+                _turn_for_api = locals().get("_telemetry_turn") or current_turn()
+                if _turn_for_api is not None:
+                    _api_span = _turn_for_api.start_span(
+                        "model.stream" if self._has_stream_consumers() else "model.prefill",
+                        api_call_count=api_call_count,
+                        model=self.model,
+                        provider=self.provider,
+                        approx_input_tokens=approx_tokens,
+                        message_count=len(api_messages),
+                        tool_schema_count=len(self.tools or []),
+                    )
+                    _api_span.__enter__()
+            except Exception:
+                _api_span = None
             retry_count = 0
             max_retries = self._api_max_retries
             primary_recovery_attempted = False
@@ -11628,6 +11907,11 @@ class AIAgent:
                         response = self._interruptible_api_call(api_kwargs)
                     
                     api_duration = time.time() - api_start_time
+                    try:
+                        _api_span.finish(status="ok", duration_s=api_duration, finish_reason=finish_reason)
+                        _api_span.__exit__(None, None, None)
+                    except Exception:
+                        pass
                     
                     # Stop thinking spinner silently -- the response box or tool
                     # execution messages that follow are more informative.
@@ -14350,6 +14634,29 @@ class AIAgent:
                 break
 
         # Build result with interrupt info if applicable
+        _turn_for_finish = locals().get("_telemetry_turn") or current_turn()
+        if final_response and not getattr(self, "_current_streamed_assistant_text", ""):
+            try:
+                if _turn_for_finish is not None:
+                    _turn_for_finish.mark_output(final_response)
+            except Exception:
+                pass
+        try:
+            if _turn_for_finish is not None:
+                _turn_for_finish.finish(
+                    status="interrupted" if interrupted else "ok" if completed else "error",
+                    error=None if completed else _turn_exit_reason,
+                    api_calls=api_call_count,
+                    completed=completed,
+                    interrupted=interrupted,
+                    turn_exit_reason=_turn_exit_reason,
+                    output_tokens=self.session_output_tokens,
+                    input_tokens=self.session_input_tokens,
+                    cache_read_tokens=self.session_cache_read_tokens,
+                    cache_write_tokens=self.session_cache_write_tokens,
+                )
+        except Exception:
+            pass
         result = {
             "final_response": final_response,
             "last_reasoning": last_reasoning,

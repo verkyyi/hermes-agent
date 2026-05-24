@@ -780,6 +780,19 @@ DEFAULT_CONFIG = {
             "timeout": 30,
             "extra_body": {},
         },
+        # Kanban completion synthesis — concise user-facing notification text
+        # from durable worker handoffs. Prefer a fast auxiliary model so
+        # completion pings do not wait on a slow main reasoning model; if
+        # OpenRouter is unavailable, auxiliary_client falls back to its normal
+        # auto-detection chain.
+        "kanban_synthesis": {
+            "provider": "openrouter",
+            "model": "google/gemini-2.5-flash",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+            "extra_body": {},
+        },
         # Triage specifier — flesh out a rough one-liner in the Kanban
         # Triage column into a concrete spec, then promote it to ``todo``.
         # Invoked by ``hermes kanban specify`` (single id or --all). Set a
@@ -978,6 +991,17 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+    },
+
+    # AgentFeeds ambient context. When enabled, the stable stream inventory is
+    # inserted into shared system-prompt assembly for prompt-cache reuse; the
+    # plugin should then inject only prompt-relevant dynamic freshness hints.
+    "agentfeeds": {
+        "system_prompt": {
+            "enabled": False,
+            "timeout_seconds": 1.0,
+            "max_per_group": 12,
+        },
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
@@ -1263,6 +1287,10 @@ DEFAULT_CONFIG = {
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Bound on user-facing completion synthesis. The synthesis path uses a
+        # fast auxiliary model by default and falls back deterministically on
+        # timeout/failure, but this keeps a bad provider from blocking forever.
+        "synthesis_timeout_seconds": 120,
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
@@ -1373,7 +1401,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 23,
+    "_config_version": 24,
 }
 
 # =============================================================================
@@ -2901,8 +2929,8 @@ _KNOWN_ROOT_KEYS = {
     "_config_version", "model", "providers", "fallback_model",
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
-    "auxiliary", "custom_providers", "context", "memory", "gateway",
-    "sessions",
+    "auxiliary", "custom_providers", "context", "memory", "agentfeeds",
+    "gateway", "sessions",
 }
 
 # Valid fields inside a custom_providers list entry

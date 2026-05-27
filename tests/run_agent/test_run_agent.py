@@ -5401,3 +5401,42 @@ class TestMemoryProviderTurnStart:
         import inspect
         src = inspect.getsource(AIAgent.run_conversation)
         assert "on_turn_start(self._user_turn_count" in src
+
+
+class TestAgentFeedsManifestPlacement:
+    """The AgentFeeds system manifest is a stable, per-session inventory and
+    must be appended to the cache-stable region of the system prompt
+    (``stable_parts``), not the volatile/context tail that would defeat
+    prompt caching when it shifts.
+
+    Regression: the pre-patch code appended to a non-existent ``prompt_parts``
+    local, which raised ``NameError`` whenever the manifest was enabled and
+    non-empty. Building the prompt with a live manifest must not raise.
+    """
+
+    _SENTINEL = "AGENTFEEDS-MANIFEST-SENTINEL-7f3a"
+
+    def test_manifest_lands_in_stable_region_only(self, agent, monkeypatch):
+        monkeypatch.setattr(
+            run_agent, "_build_agentfeeds_system_manifest",
+            lambda *a, **k: self._SENTINEL,
+        )
+        agent._agentfeeds_system_prompt_config = {"enabled": True}
+
+        parts = agent._build_system_prompt_parts()
+
+        assert self._SENTINEL in parts["stable"]
+        assert self._SENTINEL not in parts["context"]
+        assert self._SENTINEL not in parts["volatile"]
+
+    def test_disabled_manifest_omitted_without_error(self, agent, monkeypatch):
+        monkeypatch.setattr(
+            run_agent, "_build_agentfeeds_system_manifest",
+            lambda *a, **k: None,
+        )
+        agent._agentfeeds_system_prompt_config = {}
+
+        parts = agent._build_system_prompt_parts()
+
+        assert self._SENTINEL not in parts["stable"]
+        assert isinstance(parts["stable"], str)

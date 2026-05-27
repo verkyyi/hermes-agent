@@ -4990,17 +4990,28 @@ def add_notify_sub(
     notifier_profile: Optional[str] = None,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
-    for ``task_id``. Idempotent on (task, platform, chat, thread)."""
+    for ``task_id``. Upsert on (task, platform, chat, thread): re-subscribing
+    updates the notification mode and back-fills origin/identity fields
+    (without clobbering existing values) and never resets the delivery
+    cursor (``last_event_id``) or ``created_at``."""
     now = int(time.time())
     mode = _normalize_notification_mode(notification_mode)
     with write_txn(conn):
         conn.execute(
             """
-            INSERT OR IGNORE INTO kanban_notify_subs
+            INSERT INTO kanban_notify_subs
                 (task_id, platform, chat_id, thread_id, user_id,
                  notification_mode, origin_session_id, origin_profile,
                  origin_context, request_id, notifier_profile, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id, platform, chat_id, thread_id) DO UPDATE SET
+                notification_mode = excluded.notification_mode,
+                user_id           = COALESCE(excluded.user_id, user_id),
+                origin_session_id = COALESCE(excluded.origin_session_id, origin_session_id),
+                origin_profile    = COALESCE(excluded.origin_profile, origin_profile),
+                origin_context    = COALESCE(excluded.origin_context, origin_context),
+                request_id        = COALESCE(excluded.request_id, request_id),
+                notifier_profile  = COALESCE(excluded.notifier_profile, notifier_profile)
             """,
             (
                 task_id, platform, chat_id, thread_id or "", user_id,

@@ -206,3 +206,43 @@ def test_dispatch_preflights_unknown_forced_skill_before_spawn(kanban_home):
         assert "missing-kanban-skill" in run.error
         assert run.metadata["preflight"] == "skills"
         assert "missing-kanban-skill" in run.metadata["missing_skills"]
+
+
+def test_add_notify_sub_upserts_without_resetting_cursor(kanban_home):
+    """Re-subscribing the same (task, platform, chat, thread) updates the
+    notification mode and back-fills origin fields, COALESCE-preserves values
+    omitted by the second call, never duplicates the row, and never resets the
+    delivery cursor (last_event_id) or created_at. Guards the local upsert
+    patch to add_notify_sub (was INSERT OR IGNORE)."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="upsert", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="c1",
+            thread_id="t1", user_id="u1", notification_mode="direct",
+            origin_session_id="sess-1",
+        )
+        # Advance the delivery cursor to prove a re-subscribe preserves it.
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = 99 WHERE task_id = ?",
+            (task_id,),
+        )
+        conn.commit()
+        before = kb.list_notify_subs(conn, task_id)[0]
+
+        # Re-subscribe: change mode, add origin_profile, omit user_id /
+        # origin_session_id (must be COALESCE-preserved).
+        kb.add_notify_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="c1",
+            thread_id="t1", notification_mode="synthesize",
+            origin_profile="orchestrator",
+        )
+        subs = kb.list_notify_subs(conn, task_id)
+
+    assert len(subs) == 1                              # upsert, not a duplicate
+    row = subs[0]
+    assert row["notification_mode"] == "synthesize"    # updated
+    assert row["origin_profile"] == "orchestrator"     # back-filled
+    assert row["origin_session_id"] == "sess-1"        # preserved (omitted)
+    assert row["user_id"] == "u1"                      # preserved (omitted)
+    assert row["last_event_id"] == 99                  # cursor NOT reset
+    assert row["created_at"] == before["created_at"]   # creation time preserved

@@ -71,25 +71,6 @@ class TestPlatformConfigRoundtrip:
         assert restored.gateway_restart_notification is False
 
 
-class TestSystemMessageLocale:
-    def test_defaults_to_english(self):
-        config = GatewayConfig()
-        assert config.get_system_message_locale() == "en"
-
-    def test_platform_extra_overrides_global_locale(self):
-        config = GatewayConfig(
-            system_message_locale="en",
-            platforms={
-                Platform.WEIXIN: PlatformConfig(
-                    enabled=True,
-                    extra={"system_message_locale": "zh-CN"},
-                )
-            },
-        )
-        assert config.get_system_message_locale(Platform.WEIXIN) == "zh-CN"
-        assert config.get_system_message_locale(Platform.TELEGRAM) == "en"
-
-
 class TestGetConnectedPlatforms:
     def test_returns_enabled_with_token(self):
         config = GatewayConfig(

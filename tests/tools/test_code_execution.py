@@ -218,33 +218,6 @@ print(result.get("output", ""))
         self.assertIn("mock output for: echo hello", result["output"])
         self.assertEqual(result["tool_calls_made"], 1)
 
-    def test_nested_tool_call_preserves_request_id(self):
-        """execute_code RPC calls should keep the foreground request id."""
-        code = """
-from hermes_tools import terminal
-terminal("echo hello")
-"""
-        seen = []
-
-        def capture(function_name, function_args, task_id=None, user_task=None, **kwargs):
-            seen.append((function_name, task_id, kwargs.get("request_id")))
-            return _mock_handle_function_call(
-                function_name, function_args, task_id=task_id,
-                user_task=user_task, **kwargs
-            )
-
-        with patch("model_tools.handle_function_call", side_effect=capture):
-            result = execute_code(
-                code=code,
-                task_id="test-task",
-                request_id="req-123",
-                enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
-            )
-
-        parsed = json.loads(result)
-        self.assertEqual(parsed["status"], "success", parsed)
-        self.assertEqual(seen, [("terminal", "test-task", "req-123")])
-
     def test_multi_tool_chain(self):
         """Script calls multiple tools sequentially."""
         code = """

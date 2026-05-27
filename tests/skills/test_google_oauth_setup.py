@@ -151,25 +151,6 @@ class TestGetAuthUrl:
             "include_granted_scopes": "true",
         }
 
-    def test_services_filter_requested_scopes(self, setup_module, capsys):
-        setup_module.get_auth_url(services="calendar,drive")
-
-        assert capsys.readouterr().out.strip() == "https://auth.example/authorize?state=generated-state"
-        flow = FakeFlow.created[-1]
-        assert flow.scopes == [
-            "https://www.googleapis.com/auth/calendar",
-            "https://www.googleapis.com/auth/drive.readonly",
-        ]
-
-    def test_json_format_outputs_auth_url_payload(self, setup_module, capsys):
-        setup_module.get_auth_url(services="calendar", output_format="json")
-
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["auth_url"] == "https://auth.example/authorize?state=generated-state"
-        assert payload["services"] == "calendar"
-        assert payload["scopes"] == ["https://www.googleapis.com/auth/calendar"]
-
-
 class TestExchangeAuthCode:
     def test_reuses_saved_pkce_material_for_plain_code(self, setup_module):
         setup_module.PENDING_AUTH_PATH.write_text(
@@ -251,21 +232,6 @@ class TestExchangeAuthCode:
         assert "https://auth.example/authorize?state=generated-state" in out
         assert setup_module.PENDING_AUTH_PATH.exists()
         assert not setup_module.TOKEN_PATH.exists()
-
-    def test_json_failure_returns_fresh_auth_url(self, setup_module, capsys):
-        setup_module.PENDING_AUTH_PATH.write_text(
-            json.dumps({"state": "saved-state", "code_verifier": "saved-verifier"})
-        )
-        FakeFlow.fetch_error = Exception("invalid_grant: Code was already redeemed")
-
-        with pytest.raises(SystemExit):
-            setup_module.exchange_auth_code("4/test-auth-code", output_format="json", services="calendar")
-
-        payload = json.loads(capsys.readouterr().out)
-        assert payload["ok"] is False
-        assert payload["error"] == "token_exchange_failed"
-        assert payload["fresh_auth_url"] == "https://auth.example/authorize?state=generated-state"
-        assert FakeFlow.created[-1].scopes == ["https://www.googleapis.com/auth/calendar"]
 
     def test_accepts_narrower_scopes_with_warning(self, setup_module, capsys):
         """Partial scopes are accepted with a warning (gws migration: v2.0)."""

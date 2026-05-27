@@ -6319,7 +6319,7 @@ class AIAgent:
             {"agentfeeds": {"system_prompt": getattr(self, "_agentfeeds_system_prompt_config", {})}}
         )
         if _agentfeeds_manifest:
-            prompt_parts.append(_agentfeeds_manifest)
+            stable_parts.append(_agentfeeds_manifest)
 
         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
         if has_skills_tools:

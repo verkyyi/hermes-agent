@@ -162,8 +162,12 @@ Deterministic benchmark over emulated user sessions for the front-desk default
 profile — drives the real gateway pre-LLM-ack + public-progress policies and
 scores time-to-first-feedback. Opt-in live TTFT mode (`run_live.py`) invokes the
 real agent and reads measured ttft/ttfa/ttlt from telemetry. Ships a Claude Code
-skill (`.claude/skills/responsiveness-benchmark`).
-Files: `evals/responsiveness/`, `tests/responsiveness_benchmark/`.
+skill (`.claude/skills/responsiveness-benchmark/SKILL.md`) — the **only** file
+this fork tracks under `.claude/` (no `.gitignore` rule covers `.claude/`, so it
+was committed deliberately). Relocate or drop it if upstreaming; a personal copy
+at `~/.claude/skills/responsiveness-benchmark/` serves non-repo sessions either way.
+Files: `evals/responsiveness/`, `tests/responsiveness_benchmark/`,
+`.claude/skills/responsiveness-benchmark/SKILL.md`.
 
 ---
 

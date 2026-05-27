@@ -1180,6 +1180,7 @@ def test_create_worker_root_task_inherits_current_origin_subscription(worker_env
         "chat_id": "chat-456",
         "thread_id": "thread-789",
         "notification_mode": "synthesize",
+        "request_id": None,
         "inherited_from_task": worker_env,
     }
 
@@ -1287,6 +1288,7 @@ def test_create_auto_subscribes_cli_origin(monkeypatch, tmp_path):
         "chat_id": "session-123",
         "thread_id": "",
         "notification_mode": "direct",
+        "request_id": None,
     }
 
     with kb.connect() as conn:
@@ -1347,6 +1349,7 @@ def test_create_auto_subscribes_gateway_origin_with_chat_id(monkeypatch, tmp_pat
         "chat_id": "chat-456",
         "thread_id": "thread-789",
         "notification_mode": "synthesize",
+        "request_id": None,
     }
     assert d["user_facing_status"] == "I’ll look into it and report back here."
 

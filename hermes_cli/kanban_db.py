@@ -1110,19 +1110,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         notify_cols = {
             row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")
         }
-        if "notification_mode" not in notify_cols:
-            conn.execute(
-                "ALTER TABLE kanban_notify_subs ADD COLUMN "
-                "notification_mode TEXT NOT NULL DEFAULT 'direct'"
-            )
-        if "origin_session_id" not in notify_cols:
-            conn.execute("ALTER TABLE kanban_notify_subs ADD COLUMN origin_session_id TEXT")
-        if "origin_profile" not in notify_cols:
-            conn.execute("ALTER TABLE kanban_notify_subs ADD COLUMN origin_profile TEXT")
-        if "origin_context" not in notify_cols:
-            conn.execute("ALTER TABLE kanban_notify_subs ADD COLUMN origin_context TEXT")
-        if "request_id" not in notify_cols:
-            conn.execute("ALTER TABLE kanban_notify_subs ADD COLUMN request_id TEXT")
+        # NOTE: notification_mode / origin_session_id / origin_profile /
+        # origin_context / request_id are now part of the base CREATE TABLE
+        # schema above (upstream v0.14.0 / v2026.5.16 picked them up via PR
+        # #21523 → commit be4900d9d). The legacy ALTER-guard block was
+        # removed in the post-v0.14.0 cleanup. notifier_profile is also in
+        # the base schema, but we keep its ALTER guard because legacy DBs
+        # created by older upstream releases predate it and the column is
+        # nullable so the guard is cheap.
         if "notifier_profile" not in notify_cols:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
@@ -2779,10 +2774,12 @@ def complete_task(
             pass
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
-        # second SQL round-trip. First line only, 400 char cap — the
-        # full summary stays on the run row.
+        # second SQL round-trip. Full content — DB column is TEXT and
+        # the worker's intentional handoff is the single source of
+        # truth that downstream readers (Telegram/synth/dashboard) must
+        # see in full. Don't truncate or split lines here.
         ev_summary = (summary if summary is not None else result) or ""
-        ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
+        ev_summary = ev_summary.strip() if ev_summary else ""
         completed_payload: dict = {
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,

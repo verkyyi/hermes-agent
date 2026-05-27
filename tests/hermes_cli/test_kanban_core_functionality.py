@@ -1942,13 +1942,16 @@ def test_completed_event_payload_carries_summary(kanban_home):
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")
         kb.claim_task(conn, tid)
-        kb.complete_task(conn, tid, summary="handoff line 1\nextra",
+        long_body = "B" * 5000
+        kb.complete_task(conn, tid, summary=f"handoff line 1\nextra\n{long_body}",
                          metadata={"n": 3})
         events = kb.list_events(conn, tid)
         comp = [e for e in events if e.kind == "completed"]
         assert len(comp) == 1
-        # First-line-only, within the 400-char cap, preserved verbatim.
-        assert comp[0].payload["summary"] == "handoff line 1"
+        # Full summary is preserved verbatim — Kanban DB is the single
+        # source of truth and downstream notifiers must see the complete
+        # handoff (no first-line slicing, no char cap).
+        assert comp[0].payload["summary"] == f"handoff line 1\nextra\n{long_body}"
     finally:
         conn.close()
 

@@ -39,6 +39,7 @@ test coverage lives — so the divergence stays legible across upstream merges.
 | 17 | Default-profile responsiveness benchmark + live TTFT | `95772b8f5` | `tests/responsiveness_benchmark/` (28 GREEN + 2 `xfail`) |
 | 18 | Re-applied CVE security pins dropped by the v2026.5.16 merge | `84ceb225c` | _none dedicated_ (lockfile/pin change) |
 | 19 | `tests/local/` extraction (merge-pain reduction) | `894daa376` | _test-organization meta_ |
+| 20 | Notify-subscription upsert (re-subscribe updates mode/origin; no cursor reset) | `c653c8881` | `tests/local/hermes_cli/test_kanban_db.py` |
 
 ---
 
@@ -84,6 +85,16 @@ Hardens kanban run lifecycle: heartbeat extends only the owner's current run,
 stale heartbeats don't extend foreign runs, completion-rejection context
 identifies stale runs, blocked-task recovery preserves audit history, and
 spawn-failure payloads include a log tail.
+Key file: `hermes_cli/kanban_db.py`.
+
+### 20. Notify-subscription upsert (`c653c8881`)
+`add_notify_sub` uses `INSERT ... ON CONFLICT(task_id,platform,chat_id,thread_id)
+DO UPDATE` instead of `INSERT OR IGNORE`: a re-subscribe updates
+`notification_mode` and back-fills origin/identity fields (COALESCE-preserving
+any the new call omits), never duplicates the row, and never resets the
+delivery cursor (`last_event_id`) or `created_at`. Ported from the retired
+`agent-driven-kanban-orchestration` branch (task t_cd8321e9); that branch's
+other change (per-origin conversation locks) was already in deploy.
 Key file: `hermes_cli/kanban_db.py`.
 
 ### 6 & 7. Orchestrator 3-layer routing + benchmark (`95757a2c3`, `13c1fc21e`)

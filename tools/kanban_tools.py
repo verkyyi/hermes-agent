@@ -710,6 +710,21 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    # Front-desk invariant: the DEFAULT front-desk profile routes ALL work
+    # through the orchestrator and may not assign straight to a worker lane.
+    # Scoped to the default profile specifically (HERMES_PROFILE unset/"default"
+    # and not dispatcher-spawned). Exempt: the orchestrator profile — both
+    # dispatcher-spawned (HERMES_KANBAN_TASK set) AND its interactive routing
+    # surface (HERMES_PROFILE=orchestrator, no task) — plus any worker, since
+    # fanning out to worker lanes is their job. Reject (don't coerce) so the
+    # model re-issues with the right assignee.
+    _profile = os.environ.get("HERMES_PROFILE", "").strip().lower()
+    _is_frontdesk = not os.environ.get("HERMES_KANBAN_TASK") and _profile in ("", "default")
+    if _is_frontdesk and str(assignee).strip().lower() != "orchestrator":
+        return tool_error(
+            "front-desk tasks must be assigned to 'orchestrator' (it routes "
+            "to the right worker). Re-create with assignee='orchestrator'."
+        )
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")

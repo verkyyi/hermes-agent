@@ -303,6 +303,42 @@ async def test_silent_mode_noops(monkeypatch):
     assert adapter.calls == []
 
 
+@pytest.mark.asyncio
+async def test_synthesize_wake_runs_outside_conversation_lock(monkeypatch):
+    """Regression: the wake must NOT run while the notifier holds the per-session
+    conversation lock. ``_handle_message`` acquires that same lock, so holding it
+    here self-deadlocks the wake (it hangs until the wake timeout, then degrades
+    to a direct send). The fake turn asserts no conversation lock is held."""
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "synthesize")
+    runner = object.__new__(GatewayRunner)
+    runner._conversation_locks = {}
+    adapter = _Adapter(SendResult(success=True, message_id="m1"))
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    sub = {"task_id": "t_lock", "platform": "telegram", "chat_id": "123", "user_id": "123"}
+    ev = SimpleNamespace(kind="completed", payload={"summary": "h"}, run_id=1)
+
+    seen = {}
+
+    async def fake_handle_message(event):
+        # Mirror the real agent turn: it will acquire the per-session lock. If
+        # the notifier is (wrongly) holding it, one is already locked here.
+        seen["any_locked"] = any(
+            lock.locked() for lock in (runner._conversation_locks or {}).values()
+        )
+        return "reply"
+
+    monkeypatch.setattr(runner, "_handle_message", fake_handle_message)
+
+    # Bound the call so a regression (deadlock) surfaces as a failure, not a hang.
+    await asyncio.wait_for(
+        runner._send_kanban_notification(adapter, sub, "direct", {}, event=ev, task=None),
+        timeout=3,
+    )
+
+    assert seen.get("any_locked") is False
+    assert adapter.calls and adapter.calls[0][1] == "reply"
+
+
 # ---------------------------------------------------------------------------
 # Direct-mode mirroring + per-origin lock serialization
 # ---------------------------------------------------------------------------
@@ -340,7 +376,12 @@ async def test_direct_notification_mirrors_into_origin_session(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_wake_waits_for_active_origin_session_lock(monkeypatch):
+async def test_wake_serializes_via_handle_message_lock(monkeypatch):
+    """Serialization against the active origin turn is preserved — but it lives
+    INSIDE the wake's ``_handle_message`` (which acquires the per-session lock),
+    NOT in the notifier. So a wake whose turn needs the lock waits while it's
+    held, then proceeds once released. (On the old code the notifier held the
+    lock around the wake, so this same turn would self-deadlock and hang.)"""
     monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "synthesize")
     runner = object.__new__(GatewayRunner)
     runner._conversation_locks = {}
@@ -353,11 +394,13 @@ async def test_wake_waits_for_active_origin_session_lock(monkeypatch):
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1", thread_id="7")
     lock = runner._conversation_lock_for_source(source)
     await lock.acquire()
-    wake_started = asyncio.Event()
+    wake_done = asyncio.Event()
 
     async def fake_handle_message(event):
-        wake_started.set()
-        return "synth after native"
+        # Mirror the real agent turn: acquire the same per-session lock.
+        async with runner._conversation_lock_for_source(source):
+            wake_done.set()
+            return "synth after native"
 
     monkeypatch.setattr(runner, "_handle_message", fake_handle_message)
 
@@ -369,12 +412,12 @@ async def test_wake_waits_for_active_origin_session_lock(monkeypatch):
     )
     await asyncio.sleep(0)
 
-    # Held lock blocks the wake from starting.
+    # The wake's turn is waiting on the held lock — nothing delivered yet.
     assert adapter.calls == []
-    assert not wake_started.is_set()
+    assert not wake_done.is_set()
 
     lock.release()
-    await asyncio.wait_for(task, timeout=1)
+    await asyncio.wait_for(task, timeout=2)
 
     assert adapter.calls == [("123", "synth after native", {"thread_id": "7"})]
 

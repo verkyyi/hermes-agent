@@ -101,23 +101,24 @@ class KanbanSynthesisMixin:
             except Exception:
                 pass
 
+        # Synthesize completion: re-enter the worker handoff into the origin
+        # session via the normal agent loop. ``_handle_message`` acquires the
+        # per-session conversation lock ITSELF, so the wake must run OUTSIDE that
+        # lock — wrapping it in ``_conversation_lock_for_source`` self-deadlocks
+        # (the wake's turn waits forever for a lock the notifier already holds,
+        # then the wake timeout fires and silently degrades to a direct send).
+        # Reuses the synthetic-turn dispatch proven by ``_process_handoff``;
+        # bounded by a timeout, falls back to the direct status line on failure.
+        if mode == "synthesize" and getattr(event, "kind", None) == "completed":
+            await self._wake_with_fallback(
+                sub=sub, event=event, task=task, board=board,
+                msg=msg, metadata=metadata, adapter=adapter,
+            )
+            _record_gateway_span("kanban.origin_session_woken")
+            return
+
         async def _send_and_mirror() -> None:
             nonlocal send_msg
-            if mode == "synthesize" and getattr(event, "kind", None) == "completed":
-                # Re-enter the worker handoff into the origin session as a
-                # synthetic inbound turn instead of running a gateway-side LLM
-                # rewrite. The origin profile's normal agent loop composes and
-                # delivers the user-facing reply (with full tool access to read
-                # artifacts) — no second rendering path in the gateway. Reuses
-                # the synthetic-turn dispatch proven by _process_handoff. Bounded
-                # by a timeout; on any failure falls back to the direct status
-                # line so the user always gets something.
-                await self._wake_with_fallback(
-                    sub=sub, event=event, task=task, board=board,
-                    msg=msg, metadata=metadata, adapter=adapter,
-                )
-                _record_gateway_span("kanban.origin_session_woken")
-                return
             adapter_started = time.monotonic()
             adapter_status = "ok"
             adapter_error = None

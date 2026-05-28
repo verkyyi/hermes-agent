@@ -231,10 +231,34 @@ to decide delivery, removing the footgun of a model setting `silent` on a
 user-visible task. The notifier also skips watcher artifact delivery in
 `synthesize` mode (the woken agent surfaces artifacts itself).
 
-> **Live-verification gap.** All paths are unit-verified with fakes
-> (`_handle_message`/adapter/config); the real Telegram round-trip and the full
-> live `decompose → park → re-dispatch → aggregate → wake → deliver` loop are
-> **not** exercised by the suite. Smoke-test one real kanban task after deploy.
+**Origin-return reliability hardening (`3849a3663`, `e38ecbf47`, `33e6526cf`).**
+A real-LLM e2e (`evals/origin_return/run.py`, run *outside* pytest — the suite
+isolates `HERMES_HOME` and `hermes_cli/auth.py` blocks real creds under
+`PYTEST_CURRENT_TEST`) drove the front-desk→orchestrator→worker flow and found
+three issues, now fixed:
+- **Wake self-deadlock (`3849a3663`):** `_send_kanban_notification` wrapped the
+  wake in the per-session conversation lock that the wake's own `_handle_message`
+  re-acquires → 180s timeout → silent degrade to a direct send. Fixed by running
+  the wake outside that lock (it self-serializes).
+- **Origin sub stranded on a router (`e38ecbf47`):** when a task carrying an
+  origin sub completes with pending children it delegated to, the sub now moves
+  onto those children (completion-time safety net; leaf/done-children cases keep
+  it).
+- **Reliable self-park (`33e6526cf`):** guidance alone wouldn't stop the
+  orchestrator from create+completing, so `kanban_complete` now intercepts a
+  return-anchor with pending delegated children and `park_as_fanin_anchor`s it
+  (reverse links → children run, anchor waits; park at `todo`; keep the sub).
+  The anchor stays the single return point and re-wakes to aggregate + deliver,
+  whether the orchestrator used `kanban_decompose` or create+complete.
+Tests: `tests/local/hermes_cli/test_origin_sub_propagation.py` (4),
+`tests/local/hermes_cli/test_self_park_enforce.py` (5), and the gated real-LLM
+e2e under `evals/origin_return/` (phase a + b green).
+
+> **Verification.** Deterministic paths are unit-covered; the front-desk
+> origin-subscribe and orchestrator self-park are now also covered by the gated
+> real-LLM e2e (`HERMES_RUN_LLM_EVALS`-style, run outside pytest). Still worth a
+> one-task Telegram smoke-test after deploy for the full live
+> `park → re-dispatch → aggregate → wake → deliver` loop.
 > **Upstream-PR prep (deferred):** dropping the vestigial columns (schema
 > collapse to upstream-identical) and Path-B (front-desk aggregation) remain
 > future work per the design doc.

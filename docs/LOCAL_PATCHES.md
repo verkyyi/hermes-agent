@@ -131,6 +131,25 @@ identifies stale runs, blocked-task recovery preserves audit history, and
 spawn-failure payloads include a log tail.
 Key file: `hermes_cli/kanban_db.py`.
 
+> **Permanent-failure sticky-block (`b2301c4d1`).** A preflight skill failure
+> (`_preflight_task_skills` → "Unknown skill(s): X" — a missing/disabled *forced*
+> skill) is **permanent**: it can never succeed on retry. The circuit breaker now
+> emits a **sticky `blocked`** event (via a `permanent=True` flag threaded through
+> `_record_spawn_failure` → `_record_task_failure`) instead of the auto-recoverable
+> `gave_up`, so `recompute_ready` / `_has_sticky_block` park the task for a human
+> instead of respawning it every dispatcher tick forever — the loop that helped
+> corrupt `kanban.db` on 2026-05-27 (~2.4 spawn/s). **Scoped to the preflight call
+> site only:** transient failures (crash/timeout) still emit `gave_up` and keep
+> upstream's auto-recovery, so upstream's tested breaker contract
+> (`test_kanban_blocked_sticky.py`; the `gave_up` assertions in upstream
+> `test_kanban_core_functionality.py`) is untouched — **zero upstream test edits.**
+> Recovery: fix the skill/profile + `hermes kanban unblock`, or `archive`.
+> Test: `tests/local/hermes_cli/test_kanban_core_functionality.py::test_dispatch_preflight_unknown_forced_skill_blocks_without_spawn`.
+> **Deferred:** bounding *transient*-never-clears (a non-permanent failure that
+> keeps recurring) still relies on upstream's per-streak `failure_limit`; a lifetime
+> cap + backoff (Layer 2) was scoped out to avoid diverging from upstream's
+> auto-recover contract.
+
 ### 20. Notify-subscription upsert (`c653c8881`)
 `add_notify_sub` uses `INSERT ... ON CONFLICT(task_id,platform,chat_id,thread_id)
 DO UPDATE` instead of `INSERT OR IGNORE`: a re-subscribe updates

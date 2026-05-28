@@ -26,7 +26,29 @@ test coverage lives — so the divergence stays legible across upstream merges.
 > a per-file modified-line budget (CI gate). Moving patches onto extension points
 > (#6 → plugin hook, #14 → `register_cli_command` plugin) is how that number goes
 > down. Current hot files: `gateway/run.py` (~622) and `hermes_cli/kanban_db.py`
-> (~108) — see Tier-2 in the working notes.
+> (~108).
+>
+> **Tier-2 conclusion (these two hot files are largely irreducible).** Their
+> *conflict* surface (the ~622 / ~108 modified-line counts) is dominated by fork
+> changes **woven into upstream control flow**, not separable added blocks:
+> `gateway/run.py` — the conversation-lock `async with` wrap of an upstream
+> try/finally and the public-progress loop rewrite; `hermes_cli/kanban_db.py` —
+> `expected_run_id` scoping added inside existing `UPDATE`s (#5), crash-detection
+> fingerprinting interleaved through `detect_crashed_workers`, and the removed
+> truncation in `complete_task` (#3, a deletion — nothing to extract). Extracting
+> any of these would restructure upstream code *more* (bigger diffs, behavior
+> risk in the exact state machine that corrupted `kanban.db` on 2026-05-27), so
+> they are deliberately **left in place** — resolve at merge time, guarded by the
+> #5/#20 tests. The only safe reduction available was the *added* column of
+> `run.py`: three entirely fork-added `GatewayRunner` methods
+> (`_conversation_lock_for_key`/`_for_source`, `_handle_metrics_command`) moved
+> into `gateway/gateway_forklocal.py::ForkLocalGatewayMixin`
+> (`class GatewayRunner(KanbanSynthesisMixin, KanbanNotifierMixin, ForkLocalGatewayMixin)`),
+> dropping `run.py`'s added column 657→631 with the bodies now in a zero-conflict
+> new file. Behavior-preserving (gateway suite parity; ruff clean). Tier-1 #10
+> (AgentFeeds toolset → plugin) was **declined**: it would remove only ~2 conflict
+> lines from `toolsets.py` while coupling front-desk AgentFeeds (3 platforms) to
+> an opt-in plugin — net-negative.
 
 ## Summary
 

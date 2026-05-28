@@ -16,6 +16,17 @@ test coverage lives — so the divergence stays legible across upstream merges.
 > upstream test layout) so upstream merges don't conflict on them — see
 > [Test organization](#test-organization). Keep this file current when adding,
 > removing, or materially changing a local patch.
+>
+> **Merge-surface budget.** Run `python scripts/merge_surface.py` to see where the
+> fork's *conflict* surface lives — it ranks tracked source files by the
+> ``git diff --numstat`` deletions/modifications column (edits to lines upstream
+> owns), which is what actually conflicts on a sync; new files and pure additions
+> (`+N -0`) are reported separately as low-risk. Watch this across syncs so
+> divergence doesn't creep; `--check N` exits non-zero if any source file exceeds
+> a per-file modified-line budget (CI gate). Moving patches onto extension points
+> (#6 → plugin hook, #14 → `register_cli_command` plugin) is how that number goes
+> down. Current hot files: `gateway/run.py` (~622) and `hermes_cli/kanban_db.py`
+> (~108) — see Tier-2 in the working notes.
 
 ## Summary
 

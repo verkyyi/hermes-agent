@@ -1,16 +1,20 @@
-"""Local tests extracted from /Users/verkyyi/.claude/jobs/64cd9d39/khead_notifier.py.
+"""Local tests for the Kanban completion-notification delivery path.
 
-Kept in the tests/local/ tree so upstream merges don't conflict on local
-test additions. Upstream helpers/fixtures are imported from the original
-module rather than duplicated.
+Kept in the tests/local/ tree so upstream merges don't conflict on local test
+additions. Covers the redesigned delivery: config-resolved mode
+(``_resolve_kanban_notify_mode``), the origin-session wake
+(``_wake_origin_session`` / ``_wake_with_fallback``), and the direct/silent
+paths. The old gateway-side LLM synthesis apparatus was removed (see
+docs/plans/2026-05-28-kanban-wake-origin-session.md); its tests are gone with it.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from pathlib import Path
 from types import SimpleNamespace
+
 import pytest
+
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.run import (
@@ -20,8 +24,7 @@ from gateway.run import (
     _public_progress_interval_from_env,
 )
 from gateway.session import SessionSource
-from gateway.run import GatewayRunner
-from hermes_cli import kanban_db as kb
+
 
 class _Adapter:
     def __init__(self, result):
@@ -32,6 +35,10 @@ class _Adapter:
         self.calls.append((chat_id, content, metadata))
         return self.result
 
+
+# ---------------------------------------------------------------------------
+# Notifier watch set + progress helpers (unchanged behavior)
+# ---------------------------------------------------------------------------
 
 def test_kanban_notifier_watches_heartbeat_events_for_live_progress():
     assert "heartbeat" in _KANBAN_NOTIFY_KINDS
@@ -60,6 +67,10 @@ def test_public_progress_interval_env_clamps_and_disables(monkeypatch):
     monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0")
     assert _public_progress_interval_from_env() is None
 
+
+# ---------------------------------------------------------------------------
+# SendResult failure handling (direct path; no event -> never wakes)
+# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_kanban_notification_sendresult_failure_raises(monkeypatch):
@@ -92,22 +103,20 @@ async def test_kanban_notification_sendresult_success_does_not_raise():
 
 @pytest.mark.asyncio
 async def test_kanban_notification_emits_gateway_and_adapter_spans(monkeypatch):
+    # Force direct mode so this exercises the adapter.send span path (telegram
+    # would otherwise resolve to synthesize -> the wake path).
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "direct")
     runner = object.__new__(GatewayRunner)
     adapter = _Adapter(SendResult(success=True, message_id="m1"))
-    sub = {
-        "task_id": "t_metrics",
-        "platform": "telegram",
-        "chat_id": "123",
-        "notification_mode": "direct",
-    }
+    sub = {"task_id": "t_metrics", "platform": "telegram", "chat_id": "123"}
     task = SimpleNamespace(assignee="worker", status="done")
     event = SimpleNamespace(kind="completed")
     spans = []
 
-    def fake_record_span_event(name, **kwargs):
-        spans.append((name, kwargs))
-
-    monkeypatch.setattr("agent.telemetry.record_span_event", fake_record_span_event)
+    monkeypatch.setattr(
+        "agent.telemetry.record_span_event",
+        lambda name, **kwargs: spans.append((name, kwargs)),
+    )
     monkeypatch.setattr("gateway.mirror.mirror_to_session", lambda *a, **k: True)
 
     await runner._send_kanban_notification(
@@ -126,158 +135,243 @@ async def test_kanban_notification_emits_gateway_and_adapter_spans(monkeypatch):
         assert "chat_id" not in attrs
 
 
+# ---------------------------------------------------------------------------
+# Mode resolution (operator policy via config, not the per-task sub column)
+# ---------------------------------------------------------------------------
+
+def test_resolve_notify_mode_env_overrides_all(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "direct")
+    cfg = {"kanban": {"notify": {"telegram": {"mode": "synthesize"}}}}
+    assert GatewayRunner._resolve_kanban_notify_mode("telegram", cfg) == "direct"
+
+
+def test_resolve_notify_mode_per_platform_then_global(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_NOTIFY_MODE", raising=False)
+    cfg = {"kanban": {"notify": {"mode": "direct", "telegram": {"mode": "synthesize"}}}}
+    assert GatewayRunner._resolve_kanban_notify_mode("telegram", cfg) == "synthesize"
+    assert GatewayRunner._resolve_kanban_notify_mode("discord", cfg) == "direct"
+
+
+def test_resolve_notify_mode_default_preserves_prior_behavior(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_NOTIFY_MODE", raising=False)
+    # No kanban.notify config -> built-in default mirrors the prior per-task
+    # default (interactive Telegram synthesizes; everything else is direct).
+    assert GatewayRunner._resolve_kanban_notify_mode("telegram", {}) == "synthesize"
+    assert GatewayRunner._resolve_kanban_notify_mode("discord", {}) == "direct"
+    assert GatewayRunner._resolve_kanban_notify_mode("weixin", {}) == "direct"
+
+
+def test_resolve_notify_mode_ignores_invalid_values(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_NOTIFY_MODE", raising=False)
+    cfg = {"kanban": {"notify": {"mode": "bogus"}}}
+    assert GatewayRunner._resolve_kanban_notify_mode("telegram", cfg) == "synthesize"
+
+
+def test_kanban_wake_timeout_default_and_clamp():
+    assert GatewayRunner._kanban_wake_timeout({}) == 180
+    # clamped up to the 10s floor
+    assert GatewayRunner._kanban_wake_timeout(
+        {"kanban": {"notify": {"wake_timeout_seconds": 5}}}
+    ) == 10
+    # clamped down to the 600s ceiling
+    assert GatewayRunner._kanban_wake_timeout(
+        {"kanban": {"notify": {"wake_timeout_seconds": "900"}}}
+    ) == 600
+    # invalid -> default
+    assert GatewayRunner._kanban_wake_timeout(
+        {"kanban": {"notify": {"wake_timeout_seconds": "bad"}}}
+    ) == 180
+
+
+# ---------------------------------------------------------------------------
+# Synthesize mode -> origin-session wake (completed only)
+# ---------------------------------------------------------------------------
+
 @pytest.mark.asyncio
-async def test_kanban_notification_synthesize_mode_sends_synthesized_text(monkeypatch):
+async def test_synthesize_completed_wakes_origin_session(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "synthesize")
     runner = object.__new__(GatewayRunner)
+    runner._conversation_locks = {}
     adapter = _Adapter(SendResult(success=True, message_id="m1"))
-    sub = {
-        "task_id": "t_syn",
-        "platform": "telegram",
-        "chat_id": "123",
-        "notification_mode": "synthesize",
-        "origin_context": "user asked for a concise result",
-    }
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    sub = {"task_id": "t_syn", "platform": "telegram", "chat_id": "123"}
     ev = SimpleNamespace(kind="completed", payload={"summary": "worker handoff"}, run_id=7)
 
-    async def fake_synthesize(**kwargs):
-        assert kwargs["sub"] is sub
-        assert kwargs["event"] is ev
-        assert kwargs["direct_message"] == "direct fallback"
+    woke = {}
+
+    async def fake_handle_message(event):
+        woke["event"] = event
         return "synthesized reply"
 
-    monkeypatch.setattr(runner, "_synthesize_kanban_notification", fake_synthesize)
+    monkeypatch.setattr(runner, "_handle_message", fake_handle_message)
 
     await runner._send_kanban_notification(
         adapter, sub, "direct fallback", {}, event=ev, task=None, board="default"
     )
 
-    assert adapter.calls == [("123", "synthesized reply", {})]
+    # The reply produced by the woken agent turn is delivered to the origin chat.
+    assert adapter.calls and adapter.calls[0][0] == "123"
+    assert adapter.calls[0][1] == "synthesized reply"
+    # The trigger is a synthetic INTERNAL turn carrying the worker handoff.
+    assert woke["event"].internal is True
+    assert "worker handoff" in woke["event"].text
 
 
 @pytest.mark.asyncio
-async def test_kanban_notification_synthesis_failure_uses_public_fallback(monkeypatch):
+async def test_synthesize_non_completed_event_sends_direct(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "synthesize")
     runner = object.__new__(GatewayRunner)
+    runner._conversation_locks = {}
     adapter = _Adapter(SendResult(success=True, message_id="m1"))
-    sub = {
-        "task_id": "t_syn_fail",
-        "platform": "telegram",
-        "chat_id": "123",
-        "notification_mode": "synthesize",
-    }
+    sub = {"task_id": "t_blocked", "platform": "telegram", "chat_id": "123"}
+    called = {"wake": False}
+
+    async def fake_handle_message(event):
+        called["wake"] = True
+        return "x"
+
+    monkeypatch.setattr(runner, "_handle_message", fake_handle_message)
+    monkeypatch.setattr("gateway.mirror.mirror_to_session", lambda *a, **k: True)
+
+    # A non-completed terminal event (e.g. blocked) is delivered directly, not
+    # via a wake — only `completed` carries a deliverable answer.
+    await runner._send_kanban_notification(
+        adapter, sub, "blocked status line", {}, event=SimpleNamespace(kind="blocked"),
+        task=None,
+    )
+
+    assert called["wake"] is False
+    assert adapter.calls == [("123", "blocked status line", {})]
+
+
+@pytest.mark.asyncio
+async def test_wake_failure_falls_back_to_direct(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "synthesize")
+    runner = object.__new__(GatewayRunner)
+    runner._conversation_locks = {}
+    runner.adapters = {}
+    adapter = _Adapter(SendResult(success=True, message_id="m1"))
+    sub = {"task_id": "t_syn_fail", "platform": "telegram", "chat_id": "123"}
     ev = SimpleNamespace(kind="completed", payload={"summary": "worker handoff"}, run_id=7)
 
-    async def fake_synthesize(**kwargs):
-        raise RuntimeError("synthesis unavailable")
+    async def boom(event):
+        raise RuntimeError("wake unavailable")
 
-    monkeypatch.setattr(runner, "_synthesize_kanban_notification", fake_synthesize)
+    monkeypatch.setattr(runner, "_handle_message", boom)
 
+    # Wake errors -> the user still gets the direct status line.
     await runner._send_kanban_notification(
         adapter, sub, "direct fallback", {"thread_id": "9"}, event=ev, task=None
     )
 
-    assert adapter.calls == [("123", "handoff", {"thread_id": "9"})]
+    assert adapter.calls == [("123", "direct fallback", {"thread_id": "9"})]
 
 
 @pytest.mark.asyncio
-async def test_kanban_notification_silent_mode_noops():
+async def test_wake_with_fallback_timeout_falls_back_to_direct(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {}
+    adapter = _Adapter(SendResult(success=True, message_id="m1"))
+    sub = {"task_id": "t_to", "platform": "telegram", "chat_id": "123"}
+    monkeypatch.setattr(
+        GatewayRunner, "_kanban_wake_timeout", staticmethod(lambda *a, **k: 0.01)
+    )
+
+    async def slow(event):
+        await asyncio.sleep(0.2)
+        return "too late"
+
+    monkeypatch.setattr(runner, "_handle_message", slow)
+
+    await runner._wake_with_fallback(
+        sub=sub, event=SimpleNamespace(kind="completed", payload={}),
+        task=None, board=None, msg="direct line", metadata={}, adapter=adapter,
+    )
+
+    assert adapter.calls == [("123", "direct line", {})]
+
+
+@pytest.mark.asyncio
+async def test_silent_mode_noops(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "silent")
     runner = object.__new__(GatewayRunner)
     adapter = _Adapter(SendResult(success=True, message_id="m1"))
-    sub = {
-        "task_id": "t_silent",
-        "platform": "telegram",
-        "chat_id": "123",
-        "notification_mode": "silent",
-    }
+    sub = {"task_id": "t_silent", "platform": "telegram", "chat_id": "123"}
 
     await runner._send_kanban_notification(adapter, sub, "direct fallback", {})
 
     assert adapter.calls == []
 
 
+# ---------------------------------------------------------------------------
+# Direct-mode mirroring + per-origin lock serialization
+# ---------------------------------------------------------------------------
+
 @pytest.mark.asyncio
-async def test_kanban_notification_success_mirrors_into_origin_session(monkeypatch):
+async def test_direct_notification_mirrors_into_origin_session(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "direct")
     runner = object.__new__(GatewayRunner)
     adapter = _Adapter(SendResult(success=True, message_id="m1"))
     sub = {
-        "task_id": "t_ctx",
-        "platform": "telegram",
-        "chat_id": "123",
-        "thread_id": "7",
-        "user_id": "u1",
+        "task_id": "t_ctx", "platform": "telegram", "chat_id": "123",
+        "thread_id": "7", "user_id": "u1",
     }
     mirror_calls = []
 
     def fake_mirror(platform, chat_id, message_text, source_label="cli", thread_id=None, user_id=None):
         mirror_calls.append({
-            "platform": platform,
-            "chat_id": chat_id,
-            "message_text": message_text,
-            "source_label": source_label,
-            "thread_id": thread_id,
-            "user_id": user_id,
+            "platform": platform, "chat_id": chat_id, "message_text": message_text,
+            "source_label": source_label, "thread_id": thread_id, "user_id": user_id,
         })
         return True
 
     monkeypatch.setattr("gateway.mirror.mirror_to_session", fake_mirror)
 
     await runner._send_kanban_notification(
-        adapter, sub, "done text", {"thread_id": "7"}
+        adapter, sub, "done text", {"thread_id": "7"},
+        event=SimpleNamespace(kind="completed"), task=None,
     )
 
     assert adapter.calls == [("123", "done text", {"thread_id": "7"})]
     assert mirror_calls == [{
-        "platform": "telegram",
-        "chat_id": "123",
-        "message_text": "done text",
-        "source_label": "kanban",
-        "thread_id": "7",
-        "user_id": "u1",
+        "platform": "telegram", "chat_id": "123", "message_text": "done text",
+        "source_label": "kanban", "thread_id": "7", "user_id": "u1",
     }]
 
 
 @pytest.mark.asyncio
-async def test_kanban_synthesis_waits_for_active_origin_session_lock(monkeypatch):
+async def test_wake_waits_for_active_origin_session_lock(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "synthesize")
     runner = object.__new__(GatewayRunner)
     runner._conversation_locks = {}
     adapter = _Adapter(SendResult(success=True, message_id="m1"))
+    runner.adapters = {Platform.TELEGRAM: adapter}
     sub = {
-        "task_id": "t_wait",
-        "platform": "telegram",
-        "chat_id": "123",
-        "thread_id": "7",
-        "user_id": "u1",
-        "notification_mode": "synthesize",
+        "task_id": "t_wait", "platform": "telegram", "chat_id": "123",
+        "thread_id": "7", "user_id": "u1",
     }
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="123",
-        user_id="u1",
-        thread_id="7",
-    )
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="u1", thread_id="7")
     lock = runner._conversation_lock_for_source(source)
     await lock.acquire()
-    synth_started = asyncio.Event()
+    wake_started = asyncio.Event()
 
-    async def fake_synthesize(**kwargs):
-        synth_started.set()
+    async def fake_handle_message(event):
+        wake_started.set()
         return "synth after native"
 
-    monkeypatch.setattr(runner, "_synthesize_kanban_notification", fake_synthesize)
-    monkeypatch.setattr("gateway.mirror.mirror_to_session", lambda *a, **k: True)
+    monkeypatch.setattr(runner, "_handle_message", fake_handle_message)
 
     task = asyncio.create_task(
         runner._send_kanban_notification(
-            adapter,
-            sub,
-            "direct fallback",
-            {"thread_id": "7"},
-            event=SimpleNamespace(kind="completed"),
+            adapter, sub, "direct fallback", {"thread_id": "7"},
+            event=SimpleNamespace(kind="completed", payload={"summary": "h"}),
         )
     )
     await asyncio.sleep(0)
 
+    # Held lock blocks the wake from starting.
     assert adapter.calls == []
-    assert not synth_started.is_set()
+    assert not wake_started.is_set()
 
     lock.release()
     await asyncio.wait_for(task, timeout=1)
@@ -286,7 +380,8 @@ async def test_kanban_synthesis_waits_for_active_origin_session_lock(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_kanban_notification_does_not_block_unrelated_chats(monkeypatch):
+async def test_notification_does_not_block_unrelated_chats(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "direct")
     runner = object.__new__(GatewayRunner)
     runner._conversation_locks = {}
     blocked_adapter = _Adapter(SendResult(success=True, message_id="blocked"))
@@ -312,7 +407,7 @@ async def test_kanban_notification_does_not_block_unrelated_chats(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_kanban_notification_send_failure_does_not_append_to_session(monkeypatch):
+async def test_send_failure_does_not_append_to_session(monkeypatch):
     runner = object.__new__(GatewayRunner)
     adapter = _Adapter(SendResult(success=False, error="send failed"))
     sub = {"task_id": "t_fail_mirror", "platform": "telegram", "chat_id": "123"}
@@ -327,6 +422,10 @@ async def test_kanban_notification_send_failure_does_not_append_to_session(monke
 
     assert mirror_calls == []
 
+
+# ---------------------------------------------------------------------------
+# Gateway FIFO queue + notifier ownership (unchanged behavior)
+# ---------------------------------------------------------------------------
 
 def test_gateway_queue_fifo_preserves_two_user_messages():
     runner = object.__new__(GatewayRunner)
@@ -353,8 +452,7 @@ def test_kanban_notifier_defaults_to_dispatch_owner(monkeypatch):
     runner = object.__new__(GatewayRunner)
     monkeypatch.delenv("HERMES_KANBAN_NOTIFY_IN_GATEWAY", raising=False)
     monkeypatch.setattr(
-        hermes_config,
-        "load_config",
+        hermes_config, "load_config",
         lambda: {"kanban": {"dispatch_in_gateway": False}},
     )
 
@@ -367,8 +465,7 @@ def test_kanban_notifier_explicit_config_overrides_dispatch(monkeypatch):
     runner = object.__new__(GatewayRunner)
     monkeypatch.delenv("HERMES_KANBAN_NOTIFY_IN_GATEWAY", raising=False)
     monkeypatch.setattr(
-        hermes_config,
-        "load_config",
+        hermes_config, "load_config",
         lambda: {"kanban": {"dispatch_in_gateway": False, "notify_in_gateway": True}},
     )
 
@@ -380,8 +477,7 @@ def test_kanban_notifier_env_override(monkeypatch):
 
     runner = object.__new__(GatewayRunner)
     monkeypatch.setattr(
-        hermes_config,
-        "load_config",
+        hermes_config, "load_config",
         lambda: {"kanban": {"dispatch_in_gateway": True}},
     )
 
@@ -390,196 +486,3 @@ def test_kanban_notifier_env_override(monkeypatch):
 
     monkeypatch.setenv("HERMES_KANBAN_NOTIFY_IN_GATEWAY", "true")
     assert runner._kanban_notify_in_gateway_enabled() is True
-
-
-def test_kanban_synthesis_prompt_hides_internal_workflow_by_default():
-    task = SimpleNamespace(
-        title="answer factual question",
-        body="User asked: how many airports does Guangzhou have?",
-    )
-    event = SimpleNamespace(payload={"summary": "Guangzhou has one operating passenger airport."})
-    sub = {
-        "task_id": "t_internal123",
-        "origin_context": "how many airports does Guangzhou have?",
-        "origin_session_id": "telegram:chat",
-        "origin_profile": "default",
-    }
-
-    prompt = GatewayRunner._build_kanban_synthesis_prompt(
-        sub=sub,
-        event=event,
-        task=task,
-        board="default",
-        worker_summary="Guangzhou has one operating passenger airport.",
-        worker_metadata={"assignee": "worker-research"},
-        direct_message="✔ @worker-research Kanban t_internal123 done — answer factual question",
-    )
-
-    assert "Do NOT mention Kanban" in prompt
-    assert "task ids" in prompt
-    assert "assignees" in prompt
-    assert "worker/dispatcher" in prompt
-    assert "Internal debug context" in prompt
-    assert "t_internal123" in prompt  # available for debug context, not for normal prose
-
-
-def test_kanban_synthesis_prompt_includes_safe_artifact_excerpt(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-
-    # The implementation resolves allowed roots via ~/.hermes, so create the
-    # same shape under tmp_path and point metadata at it.
-    allowed_workspace = tmp_path / ".hermes" / "kanban" / "workspaces" / "t_report"
-    allowed_workspace.mkdir(parents=True)
-    allowed_report = allowed_workspace / "report.md"
-    allowed_report.write_text(
-        "# Actual report\n\nSubstantive content, not just a path.",
-        encoding="utf-8",
-    )
-
-    task = SimpleNamespace(workspace_path=str(allowed_workspace))
-    excerpt = GatewayRunner._read_kanban_artifact_context(
-        task=task,
-        worker_metadata={"artifact_path": str(allowed_report)},
-    )
-
-    assert "Actual report" in excerpt
-    assert "Substantive content" in excerpt
-
-
-def test_kanban_public_fallback_hides_internal_plumbing_and_paths():
-    fallback = GatewayRunner._kanban_public_completion_fallback(
-        worker_summary=(
-            "✔ @worker-code Kanban t_396c8c39 done — Created report at "
-            "`/Users/verkyyi/.hermes/kanban/workspaces/t_396c8c39/report.md`"
-        ),
-        worker_metadata={},
-    )
-
-    assert "Kanban" not in fallback
-    assert "@worker-code" not in fallback
-    assert "t_396c8c39" not in fallback
-    assert "/Users/" not in fallback
-    assert "generated report" in fallback
-
-
-def test_kanban_public_fallback_sanitizes_metadata_values():
-    fallback = GatewayRunner._kanban_public_completion_fallback(
-        worker_summary="",
-        worker_metadata={
-            "result": (
-                "✔ @worker Kanban t_bebc1a4f done from "
-                "/Users/verkyyi/.hermes/kanban/workspaces/t_bebc1a4f/out.md"
-            )
-        },
-    )
-
-    assert "Kanban" not in fallback
-    assert "@worker" not in fallback
-    assert "t_bebc1a4f" not in fallback
-    assert "/Users/" not in fallback
-
-
-def test_kanban_synthesis_timeout_default_and_clamp():
-    assert GatewayRunner._kanban_synthesis_timeout({}) == 120
-    assert GatewayRunner._kanban_synthesis_timeout({"kanban": {"synthesis_timeout_seconds": 2}}) == 5
-    assert GatewayRunner._kanban_synthesis_timeout({"kanban": {"synthesis_timeout_seconds": "90"}}) == 90
-    assert GatewayRunner._kanban_synthesis_timeout({"kanban": {"synthesis_timeout_seconds": "bad"}}) == 120
-
-
-def test_kanban_synthesis_route_prefers_auxiliary_config():
-    route = GatewayRunner._kanban_synthesis_route({
-        "auxiliary": {
-            "kanban_synthesis": {
-                "provider": "openrouter",
-                "model": "google/gemini-2.5-flash",
-                "base_url": "",
-            }
-        }
-    })
-
-    assert route["provider"] == "openrouter"
-    assert route["model"] == "google/gemini-2.5-flash"
-
-
-@pytest.mark.asyncio
-async def test_kanban_synthesis_uses_auxiliary_llm_without_agent_memory(monkeypatch):
-    runner = object.__new__(GatewayRunner)
-    runner._session_model_overrides = {}
-    calls = []
-
-    async def inline_executor(fn):
-        return fn()
-
-    def fake_call_llm(**kwargs):
-        calls.append(kwargs)
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="final concise reply"))]
-        )
-
-    monkeypatch.setattr(runner, "_run_in_executor_with_context", inline_executor)
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {
-        "kanban": {"synthesis_timeout_seconds": 120},
-        "auxiliary": {"kanban_synthesis": {"provider": "openrouter", "model": "google/gemini-2.5-flash"}},
-    })
-    monkeypatch.setattr(
-        runner,
-        "_resolve_session_agent_runtime",
-        lambda **kwargs: ("main-slow-model", {"provider": "openai-codex", "api_key": "secret"}),
-    )
-    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
-
-    reply = await runner._synthesize_kanban_notification(
-        sub={"platform": "telegram", "chat_id": "123", "task_id": "t_aux"},
-        event=SimpleNamespace(id=3, kind="completed", payload={"summary": "worker handoff"}),
-        task=SimpleNamespace(title="title", body="body", workspace_path=""),
-        board="default",
-        direct_message="direct",
-    )
-
-    assert reply == "final concise reply"
-    assert calls[0]["task"] == "kanban_synthesis"
-    assert calls[0]["timeout"] == 120
-    assert calls[0]["main_runtime"]["model"] == "main-slow-model"
-    assert calls[0]["messages"][0]["content"]
-
-
-@pytest.mark.asyncio
-async def test_kanban_synthesis_timeout_fallback_logs_diagnostics(monkeypatch, caplog):
-    runner = object.__new__(GatewayRunner)
-    runner._session_model_overrides = {}
-    runner._session_db = None
-    runner._fallback_model = None
-
-    async def fake_executor(_fn):
-        await asyncio.sleep(0.05)
-        return "too late"
-
-    monkeypatch.setattr(runner, "_run_in_executor_with_context", fake_executor)
-    monkeypatch.setattr(GatewayRunner, "_kanban_synthesis_timeout", staticmethod(lambda _config: 0.01))
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {
-        "kanban": {"synthesis_timeout_seconds": 120},
-        "auxiliary": {"kanban_synthesis": {"provider": "openrouter", "model": "google/gemini-2.5-flash"}},
-    })
-    monkeypatch.setattr(
-        runner,
-        "_resolve_session_agent_runtime",
-        lambda **kwargs: ("main-slow-model", {"provider": "openai-codex", "api_key": "secret"}),
-    )
-
-    caplog.set_level(logging.WARNING, logger="gateway.run")
-    reply = await runner._synthesize_kanban_notification(
-        sub={"platform": "telegram", "chat_id": "123", "task_id": "t_timeout"},
-        event=SimpleNamespace(id=3, kind="completed", payload={"summary": "done from /Users/me/.hermes/kanban/workspaces/t_timeout/report.md"}),
-        task=SimpleNamespace(title="title", body="body", workspace_path=""),
-        board="default",
-        direct_message="direct",
-    )
-
-    assert "t_timeout" not in reply
-    assert "/Users/" not in reply
-    log_text = caplog.text
-    assert "TimeoutError" in log_text
-    assert "provider=openrouter" in log_text
-    assert "model=google/gemini-2.5-flash" in log_text
-    assert "elapsed=" in log_text
-    assert "prompt_chars=" in log_text

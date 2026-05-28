@@ -195,6 +195,8 @@ def test_kanban_direct_notification_mirrors_delivered_text_to_origin_session(tmp
     """Direct completion delivery is persisted to the origin chat session."""
     db_path = tmp_path / "direct-mirror.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    # Delivery mode is config policy now; force direct for this path.
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "direct")
     kb.init_db()
     _create_completed_subscription(
         summary="direct result",
@@ -221,10 +223,16 @@ def test_kanban_direct_notification_mirrors_delivered_text_to_origin_session(tmp
     )
 
 
-def test_kanban_synthesized_notification_mirrors_synthesized_text_to_origin_session(tmp_path, monkeypatch):
-    """Synthesize mode mirrors the final synthesized text, not raw handoff."""
-    db_path = tmp_path / "synth-mirror.db"
+def test_kanban_synthesize_mode_wakes_origin_session(tmp_path, monkeypatch):
+    """Synthesize mode delivers a real agent-turn reply via the origin-session wake.
+
+    The woken turn re-enters the worker handoff into the origin session and
+    delivers its own reply; it persists itself, so the notifier does NOT mirror
+    (mirroring is the direct-mode behavior).
+    """
+    db_path = tmp_path / "synth-wake.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "synthesize")
     kb.init_db()
     _create_completed_subscription(
         summary="raw worker handoff",
@@ -234,26 +242,23 @@ def test_kanban_synthesized_notification_mirrors_synthesized_text_to_origin_sess
 
     adapter = RecordingAdapter()
     runner = _make_runner(adapter)
+    runner._conversation_locks = {}
 
-    async def fake_synthesize(**kwargs):
+    woke = {}
+
+    async def fake_handle_message(event):
+        woke["text"] = event.text
         return "synthesized final for user"
 
-    runner._synthesize_kanban_notification = fake_synthesize
+    runner._handle_message = fake_handle_message
 
-    with patch("gateway.mirror.mirror_to_session", return_value=True) as mirror:
-        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.sent) == 1
     assert adapter.sent[0]["text"] == "synthesized final for user"
     assert adapter.sent[0]["metadata"].get("thread_id") == "thread-1"
-    mirror.assert_called_once_with(
-        "telegram",
-        "chat-1",
-        "synthesized final for user",
-        source_label="kanban",
-        thread_id="thread-1",
-        user_id="user-1",
-    )
+    # The wake re-entered the worker handoff as an internal synthetic turn.
+    assert "raw worker handoff" in woke["text"]
 
 
 def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
@@ -270,6 +275,9 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     """
     db_path = tmp_path / "redeliver-cycle.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    # Force direct mode so crashed renders the raw status line (synthesize would
+    # use friendlier public-mode phrasing).
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "direct")
     kb.init_db()
 
     conn = kb.connect()

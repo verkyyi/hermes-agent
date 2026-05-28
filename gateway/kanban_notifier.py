@@ -287,9 +287,13 @@ class KanbanNotifierMixin:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        public_mode = str(
-                            sub.get("notification_mode") or "direct"
-                        ).strip().lower() == "synthesize"
+                        # Delivery mode is operator policy resolved from config
+                        # per platform (not the per-task sub column). "public_mode"
+                        # == synthesize: friendlier user-facing phrasing for
+                        # non-completed events, and the wake owns completed events.
+                        public_mode = self._resolve_kanban_notify_mode(
+                            str(sub.get("platform") or "telegram").lower()
+                        ) == "synthesize"
                         progress_msg = None
                         if kind == "heartbeat":
                             progress_interval = _public_progress_interval_from_env()
@@ -410,8 +414,11 @@ class KanbanNotifierMixin:
                             # absolute paths in the summary;
                             # ``send_document`` / ``send_image_file`` uploads
                             # them. Only fires on the ``completed`` event so
-                            # we never spam attachments on retries.
-                            if kind == "completed":
+                            # we never spam attachments on retries. Skipped in
+                            # synthesize mode: the woken origin agent surfaces
+                            # artifacts itself, so delivering here would
+                            # double-upload.
+                            if kind == "completed" and not public_mode:
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,

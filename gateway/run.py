@@ -1981,9 +1981,10 @@ def _preserve_queued_followup_history_offset(
 
 from gateway.kanban_synthesis import KanbanSynthesisMixin
 from gateway.kanban_notifier import KanbanNotifierMixin
+from gateway.gateway_forklocal import ForkLocalGatewayMixin
 
 
-class GatewayRunner(KanbanSynthesisMixin, KanbanNotifierMixin):
+class GatewayRunner(KanbanSynthesisMixin, KanbanNotifierMixin, ForkLocalGatewayMixin):
     """
     Main gateway controller.
 
@@ -2898,26 +2899,10 @@ class GatewayRunner(KanbanSynthesisMixin, KanbanNotifierMixin):
         # process to pick up.  "interrupt" mode drops them (current behaviour).
         return self._restart_requested and self._busy_input_mode in {"queue", "steer"}
 
-    def _conversation_lock_for_key(self, session_key: str) -> asyncio.Lock:
-        """Return the per-session conversation serialization lock.
-
-        Native user turns, queued follow-ups, and synthetic completion replies
-        all acquire this lock before mutating session history or mirroring an
-        assistant message. Locks are per session key, so unrelated chats keep
-        running concurrently.
-        """
-        locks = getattr(self, "_conversation_locks", None)
-        if locks is None:
-            locks = {}
-            self._conversation_locks = locks
-        lock = locks.get(session_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            locks[session_key] = lock
-        return lock
-
-    def _conversation_lock_for_source(self, source: "SessionSource") -> asyncio.Lock:
-        return self._conversation_lock_for_key(self._session_key_for_source(source))
+    # The per-session conversation serialization locks
+    # (_conversation_lock_for_key / _conversation_lock_for_source) live in
+    # gateway/gateway_forklocal.ForkLocalGatewayMixin, mixed in via the
+    # GatewayRunner base list, to shrink the merge surface of this local patch.
 
     # -------- /queue FIFO helpers --------------------------------------
     # /queue must produce one full agent turn per invocation, in FIFO
@@ -13132,20 +13117,9 @@ class GatewayRunner(KanbanSynthesisMixin, KanbanNotifierMixin):
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
 
-    async def _handle_metrics_command(self, event: MessageEvent) -> str:
-        """Handle /metrics command -- concise local latency telemetry."""
-        hours = 24.0
-        args = event.get_command_args().strip()
-        if args:
-            try:
-                hours = max(0.1, float(args.split()[0]))
-            except Exception:
-                return "Usage: /metrics [hours]"
-        try:
-            from agent.telemetry import format_metrics_summary
-            return format_metrics_summary(window_hours=hours)
-        except Exception as exc:
-            return f"Telemetry metrics unavailable: {exc}"
+    # _handle_metrics_command (the /metrics slash-command handler) lives in
+    # gateway/gateway_forklocal.ForkLocalGatewayMixin, mixed in via the
+    # GatewayRunner base list, to shrink the merge surface of this local patch.
 
     async def _handle_usage_command(self, event: MessageEvent) -> str:
         """Handle /usage command -- show token usage for the current session.

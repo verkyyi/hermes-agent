@@ -14485,13 +14485,13 @@ class GatewayRunner(KanbanSynthesisMixin, KanbanNotifierMixin, ForkLocalGatewayM
                 )
                 return None
 
-            platform_cfg = self.config.platforms.get(platform)
-            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
-                logger.info(
-                    "Restart notification suppressed: %s has gateway_restart_notification=false",
-                    platform_str,
-                )
-                return None
+            # NOTE: intentionally NOT gated on `gateway_restart_notification`.
+            # That flag governs the *unsolicited* home-channel "Gateway online"
+            # broadcast (see _send_home_channel_startup_notifications). This
+            # path only ever targets the single chat that explicitly typed
+            # /restart (recorded in .restart_notify.json), so it's a direct
+            # reply to a command, not a broadcast — the requester always hears
+            # back even when broadcasts are muted.
 
             metadata = {"thread_id": thread_id} if thread_id else None
             locale = self.config.get_system_message_locale(platform)

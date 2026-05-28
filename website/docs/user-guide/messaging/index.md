@@ -495,6 +495,8 @@ gateway:
 
 Disable it on noisy or low-priority platforms while leaving it on for your primary chat. The notification is sent once per restart, regardless of how many sessions were in flight.
 
+`gateway_restart_notification` controls only the *unsolicited* home-channel broadcast. The chat that explicitly runs `/restart` always receives a direct "gateway restarted" reply when the gateway comes back, even with the flag set to `false` — it's a confirmation for a command you issued, not a broadcast.
+
 ### Session resume across gateway restarts
 
 When the gateway shuts down with an in-flight tool call or generation, the affected sessions are flagged as `restart_interrupted`. On the next startup, the gateway schedules an auto-resume for each one — the user gets a short heads-up in the chat ("Send any message after restart and I'll try to resume where you left off.") and the session picks up from the last committed turn when they reply.

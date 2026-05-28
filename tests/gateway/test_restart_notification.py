@@ -610,14 +610,16 @@ async def test_send_home_channel_startup_notification_default_flag_true(
 
 
 @pytest.mark.asyncio
-async def test_send_restart_notification_skipped_when_flag_disabled(
+async def test_send_restart_notification_ignores_flag_for_initiator(
     tmp_path, monkeypatch
 ):
-    """The /restart originator's notification also honors the per-platform flag.
+    """The /restart originator is notified regardless of the per-platform flag.
 
-    Slack used by end users → flag off → no "Gateway restarted" message even
-    when an end user accidentally triggers /restart. The marker file is still
-    cleaned up so the notification doesn't leak into the next boot.
+    Behavior change (2026-05-28): gateway_restart_notification now governs only
+    the unsolicited home-channel broadcast, not the direct reply to whoever
+    typed /restart. The requester explicitly asked for the action, so they
+    always get a completion reply even with the flag off. The broadcast half is
+    still muted — see test_non_initiating_home_channel_stays_silent_when_flag_disabled.
     """
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
@@ -629,12 +631,12 @@ async def test_send_restart_notification_skipped_when_flag_disabled(
 
     runner, adapter = make_restart_runner()
     runner.config.platforms[Platform.TELEGRAM].gateway_restart_notification = False
-    adapter.send = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="m"))
 
     delivered_target = await runner._send_restart_notification()
 
-    assert delivered_target is None
-    adapter.send.assert_not_called()
+    assert delivered_target == ("telegram", "42", None)
+    adapter.send.assert_called_once()
     assert not notify_path.exists()
 
 

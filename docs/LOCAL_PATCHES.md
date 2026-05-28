@@ -20,6 +20,7 @@ merge. Details live in the code and the listed commits, not here.
 - **Orchestrator hardening benchmark** — executable spec for the 3-layer design (front-desk → orchestrator → workers → fan-in). (`13c1fc21e`)
 
 ## Front-desk experience
+- **Restart comeback to initiator** — the chat that runs `/restart` always gets the "gateway restarted" reply on comeback; `gateway_restart_notification` now gates only the unsolicited home-channel broadcast (diverges from upstream, which suppressed both). **Touches upstream `tests/gateway/test_restart_notification.py` (one flipped assertion) — re-check on merge.** (`b73853109`)
 - **Telegram pre-LLM ack** — immediate acknowledgement before the LLM turn. (`0a75a7315`)
 - **UX slimming + explicit-skill policy** — hides internal Kanban plumbing from replies; front-desk skill allowlists; preloaded task skills bypass ambient filters (hard guardrails kept). (`0a75a7315`)
 - **Responsiveness benchmark + live TTFT** — scores front-desk time-to-first-feedback; ships the only file this fork tracks under `.claude/`. (`95772b8f5`)

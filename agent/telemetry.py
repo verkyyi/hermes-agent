@@ -941,57 +941,76 @@ def summarize_metrics(window_hours: float = 24.0, store: TelemetryStore | None =
 
 
 def format_metrics_summary(window_hours: float = 24.0, store: TelemetryStore | None = None) -> str:
+    """Render the metrics summary as vertical, mobile-friendly cards.
+
+    Output uses standard markdown (``**bold**`` / ``*italic*``) rather than
+    space-padded columns: Telegram renders message text in a proportional
+    font, so fixed-width tables never line up. Each platform/class becomes a
+    short labeled block that reads cleanly on a phone with no sideways scroll.
+    Latency values are shown as ``p50 / p95``.
+    """
+    def _pair(p50: float | None, p95: float | None) -> str:
+        return f"{format_ms(p50)} / {format_ms(p95)}"
+
     summary = summarize_metrics(window_hours=window_hours, store=store)
     hours = summary["window_hours"]
     total = summary["total_turns"]
-    lines = [f"Hermes metrics — last {hours:g}h", f"turns: {total}"]
+    lines = [f"**Hermes metrics — last {hours:g}h**", f"*{total} turns*"]
     if not summary["groups"]:
+        lines.append("")
         lines.append("No telemetry recorded yet.")
         return "\n".join(lines)
-    lines.append("platform/class        n  TTFA p50/p95   TTFT p50/p95   TTLT p50/p95   stream p50/p95")
     for g in summary["groups"]:
-        label = f"{g['platform']}/{g['turn_class']}"[:21]
-        lines.append(
-            f"{label:<21} {g['count']:>3}  "
-            f"{format_ms(g['ttfa_p50_ms'])}/{format_ms(g['ttfa_p95_ms']):<8}  "
-            f"{format_ms(g['ttft_p50_ms'])}/{format_ms(g['ttft_p95_ms']):<8}  "
-            f"{format_ms(g['ttlt_p50_ms'])}/{format_ms(g['ttlt_p95_ms']):<8}  "
-            f"{format_ms(g['stream_p50_ms'])}/{format_ms(g['stream_p95_ms'])}"
-        )
+        lines.append("")
+        lines.append(f"**{g['platform']}/{g['turn_class']}** · {g['count']} turns")
+        lines.append(f"  TTFA   {_pair(g['ttfa_p50_ms'], g['ttfa_p95_ms'])}")
+        lines.append(f"  TTFT   {_pair(g['ttft_p50_ms'], g['ttft_p95_ms'])}")
+        lines.append(f"  TTLT   {_pair(g['ttlt_p50_ms'], g['ttlt_p95_ms'])}")
+        lines.append(f"  stream {_pair(g['stream_p50_ms'], g['stream_p95_ms'])}")
     mix = summary.get("request_mix") or {}
     if mix:
         lines.append("")
-        lines.append("request mix")
+        lines.append("**Request mix**")
+        lines.append(f"  foreground: {mix.get('total_foreground', 0)}")
         lines.append(
-            f"foreground: {mix.get('total_foreground', 0)}  "
-            f"direct/no-kanban: {mix.get('direct_no_kanban', 0)} ({mix.get('direct_pct', 0):.0f}%)  "
-            f"kanban-dispatched: {mix.get('kanban_dispatched', 0)} ({mix.get('kanban_pct', 0):.0f}%)"
+            f"  direct/no-kanban: {mix.get('direct_no_kanban', 0)} "
+            f"({mix.get('direct_pct', 0):.0f}%)"
+        )
+        lines.append(
+            f"  kanban-dispatched: {mix.get('kanban_dispatched', 0)} "
+            f"({mix.get('kanban_pct', 0):.0f}%)"
         )
         modes = mix.get("notification_modes") or {}
         if modes:
             parts = ", ".join(f"{k}:{v}" for k, v in sorted(modes.items()))
-            lines.append(f"notification modes: {parts}")
+            lines.append(f"  notification modes: {parts}")
     async_summary = summary.get("async_kanban") or {}
     if async_summary and async_summary.get("requests"):
         lines.append("")
-        lines.append("async kanban")
+        lines.append("**Async kanban**")
+        lines.append(f"  requests: {async_summary.get('requests', 0)}")
         lines.append(
-            f"requests: {async_summary.get('requests', 0)}  "
-            f"completed notifications: {async_summary.get('completed_notifications', 0)}  "
-            f"TTFA_async p50/p95: {format_ms(async_summary.get('ttfa_async_p50_ms'))}/"
-            f"{format_ms(async_summary.get('ttfa_async_p95_ms'))}  "
-            f"TTLT_async p50/p95: {format_ms(async_summary.get('ttlt_async_p50_ms'))}/"
-            f"{format_ms(async_summary.get('ttlt_async_p95_ms'))}"
+            f"  completed notifications: {async_summary.get('completed_notifications', 0)}"
+        )
+        lines.append(
+            f"  TTFA_async {_pair(async_summary.get('ttfa_async_p50_ms'), async_summary.get('ttfa_async_p95_ms'))}"
+        )
+        lines.append(
+            f"  TTLT_async {_pair(async_summary.get('ttlt_async_p50_ms'), async_summary.get('ttlt_async_p95_ms'))}"
         )
     if summary.get("spans"):
         lines.append("")
-        lines.append("span/stage              n  total      p50/p95")
+        lines.append("**Spans** (top by total time)")
         for sp in summary["spans"]:
-            label = f"{sp['name']}"[:22]
             lines.append(
-                f"{label:<22} {sp['count']:>3}  "
-                f"{format_ms(sp['total_ms']):<9}  "
-                f"{format_ms(sp['p50_ms'])}/{format_ms(sp['p95_ms'])}"
+                f"  {sp['name']} · {sp['count']}× · total {format_ms(sp['total_ms'])} · "
+                f"{_pair(sp['p50_ms'], sp['p95_ms'])}"
             )
-    lines.append("TTFA=first ack/status or first visible output; TTFT=first visible token/message; TTLT=final response. Async TTLT correlates foreground request_id to Kanban completion notification.")
+    lines.append("")
+    lines.append("*Values shown as p50 / p95.*")
+    lines.append(
+        "*TTFA=first ack/status or visible output · TTFT=first visible token · "
+        "TTLT=final response. Async TTLT correlates the foreground request_id "
+        "to the Kanban completion notification.*"
+    )
     return "\n".join(lines)

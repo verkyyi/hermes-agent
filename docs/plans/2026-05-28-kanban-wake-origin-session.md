@@ -317,17 +317,18 @@ durability — a future lever, not v1.
    completion, or the dispatcher? *Proposed:* dispatcher posts terminal child
    transitions (uniform, no worker cooperation needed); orchestrator may add
    semantic keys in run #2.
-5. **Front-desk capability on the wake turn — RESOLVED (verified).** `read_file`
-   is in the shared messaging toolset **ungated** (`toolsets.py:37`), so the
-   front-desk can read artifacts on the wake turn. But `kanban_show`/`kanban_list`
-   are **check_fn-gated** to kanban workers (`HERMES_KANBAN_TASK` set) or profiles
-   that explicitly enable the kanban toolset (`toolsets.py:63-67`); the wake turn
-   is a gateway session, not a worker, so **board-read is off by default**.
-   Mitigation (already in the design): the wake **embeds the handoff text in the
-   synthetic prompt** and the orchestrator aggregates in run #2, so the front-desk
-   delivers + reads artifacts via `read_file` without needing board access. Only
-   if we want front-desk board drill-down do we explicitly enable read-only kanban
-   on the front-desk profile.
+5. **Front-desk capability on the wake turn — RESOLVED (verified).** The deploy
+   front-desk profile **explicitly enables the `kanban` toolset** — globally
+   (`~/.hermes/config.yaml` `toolsets: [..., kanban]`, line 13) and per-platform
+   (`platform_toolsets.telegram` line 604, `cli` line 585). So
+   `_profile_has_kanban_toolset()` (`tools/kanban_tools.py:49`) returns True and
+   the wake turn has the **full kanban surface** (`kanban_show`/`kanban_list`,
+   etc.) plus ungated `read_file` (`toolsets.py:37`). No capability gap and no
+   compensating mechanism needed: the front-desk can read the anchor task, drill
+   into individual child handoffs, and read artifact files directly.
+   Embedding the handoff in the synthetic prompt remains a **latency
+   optimization** (the answer is in-hand without a tool round-trip), not a
+   workaround for missing access.
 6. **Internal trigger persistence.** The synthetic `[task completed…]` user turn
    persists in the transcript (like `_process_handoff`). *Proposed:* accept for
    v1 (clearly bracketed); revisit if it bothers users.

@@ -18,8 +18,10 @@ real Telegram messages:
 All three run with telegram.gateway_restart_notification=False — the user's real
 config — proving the initiator hears back while the broadcast stays muted.
 
-Run:
-    venv/bin/python scripts/e2e/verify_restart_comeback.py [-v]
+Run from the repo root (use -m so it tests the checkout you're standing in;
+plain `python scripts/...` resolves `gateway` via the editable install and may
+silently test a different checkout when run from a worktree):
+    venv/bin/python -m scripts.e2e.verify_restart_comeback [-v]
 
 Exit code 0 = PASS, 1 = FAIL. The adapter's send() is recorded (real adapter
 object, no network), and HERMES_HOME is an isolated temp dir.

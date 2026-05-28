@@ -48,8 +48,17 @@ Write a standalone script under `scripts/e2e/` that:
 
 ```bash
 cd /Users/verkyyi/.hermes/hermes-agent
-venv/bin/python scripts/e2e/<your_check>.py -v   # 0 = PASS, 1 = FAIL
+venv/bin/python -m scripts.e2e.<your_check> -v   # 0 = PASS, 1 = FAIL
 ```
+
+> **Use `-m` from the repo root.** This project is an editable install, so
+> `python scripts/e2e/foo.py` sets `sys.path[0]` to the *script's* directory and
+> resolves `import gateway` via the install — which can silently be a **different
+> checkout** than your cwd (e.g. when you're in a git worktree, it loads the
+> primary checkout, not your edits). `python -m` from the repo root puts the cwd
+> on the path so you test the code you're actually standing in. Confirm a new
+> check is a real guard, not a tautology, by temporarily breaking the behavior
+> and seeing it go red.
 
 ## Reference example
 

@@ -199,6 +199,31 @@ children (or the dispatcher) call `post_blackboard_update(T0, "child:Ci",
 ("2/3 lanes done") from the single anchor — no extra subscriptions, no new
 tables (state lives in `task_comments`).
 
+### Aggregation path: A (default) vs B (future opt-in — not config)
+
+Who turns the finished children into the final answer has two possible paths:
+
+- **Path A — orchestrator re-wakes (run #2). DEFAULT, v1.** The anchor re-promotes
+  when children finish; the orchestrator runs again, *judges* completion (it may
+  spawn more work), and writes the aggregate as the anchor's completion. This is
+  exactly what upstream `decompose_triage_task` gives us for free, and it is a
+  **superset** — it always produces a correct result, including for dynamic DAGs.
+- **Path B — front-desk aggregates on the wake.** Skip run #2; "all children
+  done" wakes the front-desk, which reads the child handoffs (it has the kanban
+  toolset, see Open Decision #5) and combines them in the warm turn. Only valid
+  when the fan-out is **terminal/static** (no further orchestration needed).
+
+This is deliberately **not a global config toggle.** The choice is
+*workload-dependent, not deployment-dependent*: within one deployment, "summarize
+these 3 lookups" wants B while "investigate X, then decide what to dig into next"
+needs A. The only actor that knows is the **orchestrator at decompose time**, so
+if B is ever added it is a per-`kanban_decompose` option the orchestrator sets
+(e.g. `final_aggregation="self"` default vs `"origin"`), never an operator flag.
+Path B is also strictly more mechanism (it needs an anchor-completes-without-a-run
+trigger), so v1 ships **Path A only**; the cold re-dispatch it costs is an
+*internal* hop — the user-visible final reply is the warm front-desk wake either
+way.
+
 ### Schema collapse (→ upstream-identical)
 
 The wake resolves its target **from the sub's routing identity** and re-enters

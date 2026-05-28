@@ -35,7 +35,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import gateway.run as gateway_run
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, SendResult
+from gateway.platforms.base import MessageEvent, ProcessingOutcome, SendResult
 from gateway.platforms.telegram import TelegramAdapter
 from tests.e2e.conftest import make_adapter, make_runner, make_source
 
@@ -154,6 +154,30 @@ async def _run() -> list:
         "C: group chat quotes the first chunk under smart mode",
         bot_c.send_message.await_count >= 1 and thread_first_c == 80,
         f"sends={bot_c.send_message.await_count} first_chunk_reply_to={thread_first_c!r}",
+    ))
+
+    # ── Phase D: approval pause stamps 🤔, then completion clears it ─────────
+    # Drives the real adapter lifecycle in the order a dangerous-command turn
+    # produces it: start (👀) → awaiting approval (🤔) → completion (cleared on
+    # success). The run.py closure that triggers on_awaiting_input is covered by
+    # tests/local/gateway/test_awaiting_input_reaction.py.
+    os.environ["TELEGRAM_REACTION_SUCCESS"] = ""  # live-deploy config
+    runner_d = make_runner(Platform.TELEGRAM)
+    adapter_d = make_adapter(Platform.TELEGRAM, runner_d)
+    react_log = []
+    adapter_d._bot = MagicMock()
+    adapter_d._bot.set_message_reaction = AsyncMock(
+        side_effect=lambda **kw: react_log.append(kw.get("reaction"))
+    )
+    ev = _numeric_event("700300", "61", "delete the prod database", "dm")
+    await adapter_d.on_processing_start(ev)                       # 👀
+    await adapter_d.on_awaiting_input("700300", "61")             # 🤔 (approval prompt sent)
+    await adapter_d.on_processing_complete(ev, ProcessingOutcome.SUCCESS)  # cleared on resolve
+    _log(f"approval-pause reaction sequence={react_log!r}")
+    results.append((
+        "D: approval pause shows 👀 → 🤔 → cleared",
+        react_log == ["\U0001f440", "\U0001f914", None],
+        f"reaction sequence={react_log!r}",
     ))
 
     return results

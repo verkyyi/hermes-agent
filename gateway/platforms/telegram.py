@@ -5955,15 +5955,21 @@ class TelegramAdapter(BasePlatformAdapter):
     # TELEGRAM_REACTION_SUCCESS="" makes a completed turn clear the 👀 rather
     # than leave a repetitive 👍 on every single message (the reply text is
     # itself the success signal). config.yaml bridges these (see gateway/config).
+    #
+    # ``needs_input`` (🤔) is set mid-turn when the agent pauses for a /approve
+    # /deny decision (see on_awaiting_input); the completion hook overwrites it
+    # with the final outcome reaction once the turn resolves.
     _REACTION_ENV = {
         "progress": "TELEGRAM_REACTION_PROGRESS",
         "success": "TELEGRAM_REACTION_SUCCESS",
         "failure": "TELEGRAM_REACTION_FAILURE",
+        "needs_input": "TELEGRAM_REACTION_NEEDS_INPUT",
     }
     _REACTION_DEFAULTS = {
-        "progress": "\U0001f440",  # 👀
-        "success": "\U0001f44d",   # 👍
-        "failure": "\U0001f44e",   # 👎
+        "progress": "\U0001f440",     # 👀
+        "success": "\U0001f44d",      # 👍
+        "failure": "\U0001f44e",      # 👎
+        "needs_input": "\U0001f914",  # 🤔
     }
 
     def _reactions_enabled(self) -> bool:
@@ -6066,3 +6072,20 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._set_reaction(chat_id, message_id, emoji)
         else:
             await self._clear_reactions(chat_id, message_id)
+
+    async def on_awaiting_input(self, chat_id: str, message_id: str) -> None:
+        """Stamp the needs-input reaction (🤔) when a turn pauses for the user.
+
+        Called mid-turn when the agent blocks on a dangerous-command approval
+        (the turn is awaiting /approve or /deny). Swaps the 👀 in-progress
+        reaction for 🤔 so the user can see the bot is waiting on *them*. The
+        completion hook overwrites this with the final outcome reaction once the
+        approval resolves and the turn finishes. Empty slot = no reaction.
+        """
+        if not self._reactions_enabled():
+            return
+        if not (chat_id and message_id):
+            return
+        emoji = self._reaction_emoji("needs_input")
+        if emoji:
+            await self._set_reaction(chat_id, message_id, emoji)

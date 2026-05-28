@@ -16093,6 +16093,24 @@ class GatewayRunner(KanbanSynthesisMixin, KanbanNotifierMixin, ForkLocalGatewayM
 
     # ------------------------------------------------------------------
 
+    async def _react_awaiting_input(self, source, message_id) -> None:
+        """Best-effort: stamp a needs-input reaction on the triggering message.
+
+        Routes to the platform adapter's ``on_awaiting_input`` hook (currently
+        Telegram only) when the agent pauses for an approval decision. Any
+        failure is swallowed — a missing reaction must never disrupt the turn.
+        """
+        if not message_id:
+            return
+        try:
+            adapter = self.adapters.get(source.platform)
+            hook = getattr(adapter, "on_awaiting_input", None)
+            if hook is None:
+                return
+            await hook(source.chat_id, message_id)
+        except Exception as e:
+            logger.debug("awaiting-input reaction failed: %s", e)
+
     async def _run_agent(
         self,
         message: str,
@@ -17230,6 +17248,16 @@ class GatewayRunner(KanbanSynthesisMixin, KanbanNotifierMixin, ForkLocalGatewayM
                 # status; pausing prevents _keep_typing from re-setting it.
                 # Typing resumes in _handle_approve_command/_handle_deny_command.
                 _status_adapter.pause_typing_for_chat(_status_chat_id)
+
+                # Signal "waiting on you" on the user's message (🤔). Best-effort
+                # and fire-and-forget; the completion hook restores the final
+                # reaction once the approval resolves and the turn finishes.
+                safe_schedule_threadsafe(
+                    self._react_awaiting_input(source, event_message_id),
+                    _loop_for_step,
+                    logger=logger,
+                    log_message="awaiting-input reaction scheduling error",
+                )
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")

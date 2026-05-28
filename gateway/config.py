@@ -1024,6 +1024,7 @@ def load_gateway_config() -> GatewayConfig:
                     ("reaction_progress", "TELEGRAM_REACTION_PROGRESS"),
                     ("reaction_success", "TELEGRAM_REACTION_SUCCESS"),
                     ("reaction_failure", "TELEGRAM_REACTION_FAILURE"),
+                    ("reaction_needs_input", "TELEGRAM_REACTION_NEEDS_INPUT"),
                 ):
                     if _react_key in telegram_cfg and not os.getenv(_react_env):
                         _react_val = telegram_cfg[_react_key]

@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -44,11 +45,25 @@ def _make_runner(adapter):
     return runner
 
 
-def _create_completed_subscription(summary="done once"):
+def _create_completed_subscription(
+    summary="done once",
+    notification_mode="direct",
+    with_origin_fields=False,
+):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="notify once", assignee="worker")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kwargs = {}
+        if with_origin_fields:
+            kwargs.update(thread_id="thread-1", user_id="user-1")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            notification_mode=notification_mode,
+            **kwargs,
+        )
         kb.complete_task(conn, tid, summary=summary)
         return tid
     finally:
@@ -165,13 +180,80 @@ def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
     adapter = FailingAdapter()
     runner = _make_runner(adapter)
 
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    with patch("gateway.mirror.mirror_to_session") as mirror:
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     # Send was attempted (so we exercised the failure path, not just the
     # disconnect path) and the claim was rewound — the unseen-events query
     # still returns the event for retry on the next tick.
     assert adapter.attempts >= 1, "send should have been attempted at least once"
     assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+    mirror.assert_not_called()
+
+
+def test_kanban_direct_notification_mirrors_delivered_text_to_origin_session(tmp_path, monkeypatch):
+    """Direct completion delivery is persisted to the origin chat session."""
+    db_path = tmp_path / "direct-mirror.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _create_completed_subscription(
+        summary="direct result",
+        notification_mode="direct",
+        with_origin_fields=True,
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    with patch("gateway.mirror.mirror_to_session", return_value=True) as mirror:
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    delivered_text = adapter.sent[0]["text"]
+    assert "direct result" in delivered_text
+    mirror.assert_called_once_with(
+        "telegram",
+        "chat-1",
+        delivered_text,
+        source_label="kanban",
+        thread_id="thread-1",
+        user_id="user-1",
+    )
+
+
+def test_kanban_synthesized_notification_mirrors_synthesized_text_to_origin_session(tmp_path, monkeypatch):
+    """Synthesize mode mirrors the final synthesized text, not raw handoff."""
+    db_path = tmp_path / "synth-mirror.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    _create_completed_subscription(
+        summary="raw worker handoff",
+        notification_mode="synthesize",
+        with_origin_fields=True,
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    async def fake_synthesize(**kwargs):
+        return "synthesized final for user"
+
+    runner._synthesize_kanban_notification = fake_synthesize
+
+    with patch("gateway.mirror.mirror_to_session", return_value=True) as mirror:
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["text"] == "synthesized final for user"
+    assert adapter.sent[0]["metadata"].get("thread_id") == "thread-1"
+    mirror.assert_called_once_with(
+        "telegram",
+        "chat-1",
+        "synthesized final for user",
+        source_label="kanban",
+        thread_id="thread-1",
+        user_id="user-1",
+    )
 
 
 def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):

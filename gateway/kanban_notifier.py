@@ -280,6 +280,11 @@ class KanbanNotifierMixin:
                         )
                         continue
                     title = (task.title if task else sub["task_id"])[:120]
+                    # Set when a completed event is handed to the non-blocking
+                    # origin-session wake. The background wake task then owns the
+                    # cursor / failure / unsubscribe accounting for that event,
+                    # so the synchronous post-loop bookkeeping below must skip it.
+                    wake_dispatched = False
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
@@ -393,10 +398,24 @@ class KanbanNotifierMixin:
                             sub["task_id"], sub["platform"],
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
+                        # A completed event in synthesize mode is handed to the
+                        # non-blocking origin-session wake: _send_kanban_notification
+                        # dispatches a background task and returns immediately, so
+                        # the watcher tick is not blocked by the front-desk agent
+                        # turn. That background task owns the cursor / failure /
+                        # unsubscribe accounting for this event (see
+                        # _run_kanban_wake_delivery), which is why it receives the
+                        # claim/failure context here.
+                        wake_dispatched = kind == "completed" and public_mode
                         try:
                             await self._send_kanban_notification(
                                 adapter, sub, msg, metadata,
                                 event=ev, task=task, board=board_slug,
+                                claimed_cursor=d["cursor"],
+                                old_cursor=d.get("old_cursor", 0),
+                                sub_key=sub_key,
+                                sub_fail_counts=sub_fail_counts,
+                                max_failures=MAX_SEND_FAILURES,
                             )
                             if kind == "heartbeat":
                                 progress_sent_at[sub_key] = int(
@@ -432,8 +451,13 @@ class KanbanNotifierMixin:
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
-                            # Reset the failure counter on success.
-                            sub_fail_counts.pop(sub_key, None)
+                            # Reset the failure counter on success. For a
+                            # dispatched wake the delivery hasn't completed yet —
+                            # the background task resets (or increments) the
+                            # counter based on the real outcome, so don't reset
+                            # it prematurely here.
+                            if not wake_dispatched:
+                                sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
                             fails = sub_fail_counts.get(sub_key, 0) + 1
                             sub_fail_counts[sub_key] = fails
@@ -477,8 +501,15 @@ class KanbanNotifierMixin:
                         # dispatcher respawns the task and it cycles into the
                         # same state. See the longer comment on TERMINAL_KINDS
                         # above for the failure mode this prevents.
+                        # When the last delivered event was a dispatched wake,
+                        # the background task unsubscribes a terminal task only
+                        # after the wake actually succeeds (so a failed delivery
+                        # can still rewind + retry against the live sub). Doing it
+                        # here too would unsubscribe before the wake finishes and
+                        # defeat that retry. So skip the synchronous unsub for the
+                        # wake case and let _run_kanban_wake_delivery own it.
                         task_terminal = task and task.status in {"done", "archived"}
-                        if task_terminal:
+                        if task_terminal and not wake_dispatched:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
                             )

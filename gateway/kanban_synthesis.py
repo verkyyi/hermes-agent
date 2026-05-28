@@ -52,6 +52,11 @@ class KanbanSynthesisMixin:
         event: Any = None,
         task: Any = None,
         board: Optional[str] = None,
+        claimed_cursor: Optional[int] = None,
+        old_cursor: int = 0,
+        sub_key: Optional[tuple] = None,
+        sub_fail_counts: Optional[dict] = None,
+        max_failures: int = 3,
     ) -> None:
         """Send one Kanban notification and raise if the adapter reports failure.
 
@@ -102,19 +107,36 @@ class KanbanSynthesisMixin:
                 pass
 
         # Synthesize completion: re-enter the worker handoff into the origin
-        # session via the normal agent loop. ``_handle_message`` acquires the
-        # per-session conversation lock ITSELF, so the wake must run OUTSIDE that
-        # lock — wrapping it in ``_conversation_lock_for_source`` self-deadlocks
-        # (the wake's turn waits forever for a lock the notifier already holds,
-        # then the wake timeout fires and silently degrades to a direct send).
-        # Reuses the synthetic-turn dispatch proven by ``_process_handoff``;
-        # bounded by a timeout, falls back to the direct status line on failure.
+        # session via the normal agent loop. The wake runs a FULL front-desk
+        # agent turn (``_handle_message`` under the per-session conversation
+        # lock). Awaiting it here would block the ~5s notifier-watcher tick for
+        # the entire turn — every other board/subscription/heartbeat delivery
+        # stalls behind one chat's LLM turn, and a turn longer than the wake
+        # timeout degrades to a raw direct send. So dispatch it as a tracked
+        # background task and return immediately; the watcher tick continues.
+        #
+        # The DB cursor was already advanced at claim time
+        # (``claim_unseen_events_for_sub``), so dedup holds and the next tick
+        # won't re-deliver this event. The background task owns the delivery
+        # OUTCOME: on success it unsubscribes a terminal task and resets the
+        # failure counter; on total failure (wake AND direct fallback both fail)
+        # it rewinds the cursor for retry / drops a dead subscription — the same
+        # accounting the watcher does for the synchronous direct path. (The wake
+        # runs OUTSIDE the conversation lock — ``_handle_message`` acquires it
+        # itself; wrapping it would self-deadlock.)
         if mode == "synthesize" and getattr(event, "kind", None) == "completed":
-            await self._wake_with_fallback(
-                sub=sub, event=event, task=task, board=board,
-                msg=msg, metadata=metadata, adapter=adapter,
+            self._register_background_task(
+                asyncio.ensure_future(
+                    self._run_kanban_wake_delivery(
+                        sub=sub, event=event, task=task, board=board,
+                        msg=msg, metadata=metadata, adapter=adapter,
+                        claimed_cursor=claimed_cursor, old_cursor=old_cursor,
+                        sub_key=sub_key, sub_fail_counts=sub_fail_counts,
+                        max_failures=max_failures,
+                    )
+                )
             )
-            _record_gateway_span("kanban.origin_session_woken")
+            _record_gateway_span("kanban.origin_session_wake_dispatched")
             return
 
         async def _send_and_mirror() -> None:
@@ -377,6 +399,90 @@ class KanbanSynthesisMixin:
             raise RuntimeError(
                 getattr(result, "error", None) or "fallback adapter send failed"
             )
+
+    def _register_background_task(self, task: "asyncio.Future") -> "asyncio.Future":
+        """Track a fire-and-forget task so it isn't GC'd and shuts down cleanly.
+
+        Mirrors GatewayRunner's existing ``_background_tasks`` pattern (add +
+        discard-on-done). Created lazily so callers that bypass ``__init__``
+        (e.g. ``object.__new__(GatewayRunner)`` in tests) still work.
+        """
+        tasks = getattr(self, "_background_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._background_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return task
+
+    async def _run_kanban_wake_delivery(
+        self,
+        *,
+        sub: dict,
+        event: Any,
+        task: Any,
+        board: Optional[str],
+        msg: str,
+        metadata: "dict[str, Any]",
+        adapter: Any,
+        claimed_cursor: Optional[int] = None,
+        old_cursor: int = 0,
+        sub_key: Optional[tuple] = None,
+        sub_fail_counts: Optional[dict] = None,
+        max_failures: int = 3,
+    ) -> None:
+        """Run the origin-session wake off the notifier tick + own its outcome.
+
+        The notifier dispatches this in the background so its watcher loop is
+        not blocked by the front-desk agent turn. Because the watcher therefore
+        cannot observe the delivery result synchronously, the cursor / failure /
+        unsubscribe accounting it normally performs for the direct path moves
+        here:
+
+        * **success** — reset the per-sub failure counter and unsubscribe the
+          row when the task reached a terminal status (``done``/``archived``).
+          The cursor is already at the claimed position, so nothing to advance.
+        * **total failure** (``_wake_with_fallback`` raised — both the wake turn
+          and the direct fallback send failed) — count the failure and, after
+          ``max_failures`` consecutive ones, drop the dead subscription;
+          otherwise rewind the cursor so a later tick retries.
+
+        The accounting is skipped gracefully when the optional context
+        (``sub_key`` / ``sub_fail_counts`` / ``claimed_cursor``) is absent, so
+        direct callers and unit tests get a plain non-blocking wake.
+        """
+        try:
+            await self._wake_with_fallback(
+                sub=sub, event=event, task=task, board=board,
+                msg=msg, metadata=metadata, adapter=adapter,
+            )
+        except Exception as exc:
+            fails = 0
+            if sub_fail_counts is not None and sub_key is not None:
+                fails = sub_fail_counts.get(sub_key, 0) + 1
+                sub_fail_counts[sub_key] = fails
+            logger.warning(
+                "kanban notifier: origin-session wake delivery failed for %s "
+                "(attempt %d/%d): %s",
+                sub.get("task_id"), fails, max_failures, exc,
+            )
+            if (
+                sub_fail_counts is not None
+                and sub_key is not None
+                and fails >= max_failures
+            ):
+                await asyncio.to_thread(self._kanban_unsub, sub, board)
+                sub_fail_counts.pop(sub_key, None)
+            elif claimed_cursor is not None:
+                await asyncio.to_thread(
+                    self._kanban_rewind, sub, claimed_cursor, old_cursor, board,
+                )
+            return
+
+        if sub_fail_counts is not None and sub_key is not None:
+            sub_fail_counts.pop(sub_key, None)
+        if task is not None and getattr(task, "status", None) in {"done", "archived"}:
+            await asyncio.to_thread(self._kanban_unsub, sub, board)
 
 
 __all__ = ["KanbanSynthesisMixin"]

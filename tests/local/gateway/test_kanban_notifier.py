@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -34,6 +35,19 @@ class _Adapter:
     async def send(self, chat_id, content, metadata=None):
         self.calls.append((chat_id, content, metadata))
         return self.result
+
+
+async def _drain_wakes(runner):
+    """Await the background origin-session wake task(s) the notifier scheduled.
+
+    Synthesize-mode completion delivery is now non-blocking: the notifier
+    schedules the wake on ``runner._background_tasks`` and returns immediately
+    (see ``_run_kanban_wake_delivery``). Tests that assert on the delivered
+    reply / cursor / unsubscribe must first drain those background tasks.
+    """
+    tasks = list(getattr(runner, "_background_tasks", set()) or [])
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +222,9 @@ async def test_synthesize_completed_wakes_origin_session(monkeypatch):
     await runner._send_kanban_notification(
         adapter, sub, "direct fallback", {}, event=ev, task=None, board="default"
     )
+    # Wake is dispatched in the background (non-blocking); drain it before
+    # asserting on the delivered reply.
+    await _drain_wakes(runner)
 
     # The reply produced by the woken agent turn is delivered to the origin chat.
     assert adapter.calls and adapter.calls[0][0] == "123"
@@ -259,10 +276,12 @@ async def test_wake_failure_falls_back_to_direct(monkeypatch):
 
     monkeypatch.setattr(runner, "_handle_message", boom)
 
-    # Wake errors -> the user still gets the direct status line.
+    # Wake errors -> the user still gets the direct status line. Delivery is
+    # dispatched in the background, so drain before asserting.
     await runner._send_kanban_notification(
         adapter, sub, "direct fallback", {"thread_id": "9"}, event=ev, task=None
     )
+    await _drain_wakes(runner)
 
     assert adapter.calls == [("123", "direct fallback", {"thread_id": "9"})]
 
@@ -334,9 +353,199 @@ async def test_synthesize_wake_runs_outside_conversation_lock(monkeypatch):
         runner._send_kanban_notification(adapter, sub, "direct", {}, event=ev, task=None),
         timeout=3,
     )
+    await _drain_wakes(runner)
 
     assert seen.get("any_locked") is False
     assert adapter.calls and adapter.calls[0][1] == "reply"
+
+
+# ---------------------------------------------------------------------------
+# Non-blocking wake dispatch + background delivery accounting
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_synthesize_wake_is_non_blocking(monkeypatch):
+    """The wake runs a full front-desk agent turn; the notifier must NOT block
+    on it. _send_kanban_notification dispatches the wake in the background and
+    returns immediately, so the watcher tick is free even while the turn runs.
+    Regression for: a long front-desk turn stalling every other delivery."""
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "synthesize")
+    runner = object.__new__(GatewayRunner)
+    runner._conversation_locks = {}
+    adapter = _Adapter(SendResult(success=True, message_id="m1"))
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    sub = {"task_id": "t_nb", "platform": "telegram", "chat_id": "123"}
+    ev = SimpleNamespace(kind="completed", payload={"summary": "handoff"}, run_id=1)
+
+    gate = asyncio.Event()
+    started = asyncio.Event()
+
+    async def blocked_handle_message(event):
+        started.set()
+        await gate.wait()  # turn does not finish until the test allows it
+        return "reply after unblock"
+
+    monkeypatch.setattr(runner, "_handle_message", blocked_handle_message)
+
+    # Returns promptly even though the wake turn is still in-flight (gate unset).
+    await asyncio.wait_for(
+        runner._send_kanban_notification(
+            adapter, sub, "direct fallback", {}, event=ev, task=None,
+        ),
+        timeout=1,
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)  # bg wake is actually running
+    assert adapter.calls == []  # ...but nothing delivered yet — it is still blocked
+
+    # Let the turn finish; the background task delivers the synthesized reply.
+    gate.set()
+    await _drain_wakes(runner)
+    assert adapter.calls == [("123", "reply after unblock", None)]
+
+
+@pytest.mark.asyncio
+async def test_wake_registered_in_background_tasks_and_completes(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "synthesize")
+    runner = object.__new__(GatewayRunner)
+    runner._conversation_locks = {}
+    adapter = _Adapter(SendResult(success=True, message_id="m1"))
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    sub = {"task_id": "t_bg", "platform": "telegram", "chat_id": "123"}
+    ev = SimpleNamespace(kind="completed", payload={"summary": "h"}, run_id=1)
+
+    async def fake_handle_message(event):
+        return "r"
+
+    monkeypatch.setattr(runner, "_handle_message", fake_handle_message)
+
+    await runner._send_kanban_notification(adapter, sub, "fallback", {}, event=ev, task=None)
+
+    # The wake is tracked so it is not GC'd / can be drained on shutdown.
+    assert getattr(runner, "_background_tasks", None)
+    assert len(runner._background_tasks) == 1
+
+    await _drain_wakes(runner)
+    assert all(t.done() for t in runner._background_tasks)
+
+
+@pytest.mark.asyncio
+async def test_wake_total_failure_rewinds_cursor_for_retry(monkeypatch):
+    """If the wake turn fails AND the direct fallback send also fails, the
+    background task counts the failure and rewinds the claim cursor so a later
+    notifier tick retries — preserving the synchronous direct path's retry."""
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "synthesize")
+    runner = object.__new__(GatewayRunner)
+    runner._conversation_locks = {}
+    runner.adapters = {}
+    # Fallback send also fails -> _wake_with_fallback raises (total failure).
+    adapter = _Adapter(SendResult(success=False, error="dead chat"))
+    sub = {"task_id": "t_rt", "platform": "telegram", "chat_id": "123"}
+    ev = SimpleNamespace(kind="completed", payload={"summary": "h"}, run_id=1)
+
+    async def boom(event):
+        raise RuntimeError("wake down")
+
+    monkeypatch.setattr(runner, "_handle_message", boom)
+    rewinds = []
+    unsubs = []
+    monkeypatch.setattr(
+        runner, "_kanban_rewind",
+        lambda sub, claimed, old, board=None: rewinds.append((sub["task_id"], claimed, old, board)),
+    )
+    monkeypatch.setattr(
+        runner, "_kanban_unsub",
+        lambda sub, board=None: unsubs.append((sub["task_id"], board)),
+    )
+    fail_counts: dict = {}
+    sub_key = ("t_rt", "telegram", "123", "")
+
+    await runner._send_kanban_notification(
+        adapter, sub, "direct line", {}, event=ev, task=None,
+        claimed_cursor=5, old_cursor=2, sub_key=sub_key,
+        sub_fail_counts=fail_counts, max_failures=3,
+    )
+    await _drain_wakes(runner)
+
+    assert fail_counts[sub_key] == 1
+    assert rewinds == [("t_rt", 5, 2, None)]
+    assert unsubs == []  # not dropped yet — below the max
+
+
+@pytest.mark.asyncio
+async def test_wake_drops_subscription_after_max_failures(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "synthesize")
+    runner = object.__new__(GatewayRunner)
+    runner._conversation_locks = {}
+    runner.adapters = {}
+    adapter = _Adapter(SendResult(success=False, error="dead chat"))
+    sub = {"task_id": "t_drop", "platform": "telegram", "chat_id": "123"}
+    ev = SimpleNamespace(kind="completed", payload={"summary": "h"}, run_id=1)
+
+    async def boom(event):
+        raise RuntimeError("wake down")
+
+    monkeypatch.setattr(runner, "_handle_message", boom)
+    rewinds = []
+    unsubs = []
+    monkeypatch.setattr(
+        runner, "_kanban_rewind",
+        lambda sub, claimed, old, board=None: rewinds.append(sub["task_id"]),
+    )
+    monkeypatch.setattr(
+        runner, "_kanban_unsub",
+        lambda sub, board=None: unsubs.append((sub["task_id"], board)),
+    )
+    sub_key = ("t_drop", "telegram", "123", "")
+    fail_counts = {sub_key: 2}  # one away from the max
+
+    await runner._send_kanban_notification(
+        adapter, sub, "direct line", {}, event=ev, task=None,
+        claimed_cursor=5, old_cursor=2, sub_key=sub_key,
+        sub_fail_counts=fail_counts, max_failures=3,
+    )
+    await _drain_wakes(runner)
+
+    assert unsubs == [("t_drop", None)]  # dropped at the max
+    assert rewinds == []  # no retry once dropped
+    assert sub_key not in fail_counts  # counter cleared with the sub
+
+
+@pytest.mark.asyncio
+async def test_wake_success_unsubscribes_terminal_task(monkeypatch):
+    """On a successful wake for a done/archived task, the background task is what
+    unsubscribes (and resets the failure counter) — the watcher defers that so a
+    failed wake can still retry against the live subscription."""
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "synthesize")
+    runner = object.__new__(GatewayRunner)
+    runner._conversation_locks = {}
+    adapter = _Adapter(SendResult(success=True, message_id="m1"))
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    sub = {"task_id": "t_done", "platform": "telegram", "chat_id": "123"}
+    ev = SimpleNamespace(kind="completed", payload={"summary": "h"}, run_id=1)
+    task = SimpleNamespace(status="done", assignee="worker", title="T", result=None)
+
+    async def fake_handle_message(event):
+        return "done reply"
+
+    monkeypatch.setattr(runner, "_handle_message", fake_handle_message)
+    unsubs = []
+    monkeypatch.setattr(
+        runner, "_kanban_unsub",
+        lambda sub, board=None: unsubs.append((sub["task_id"], board)),
+    )
+    sub_key = ("t_done", "telegram", "123", "")
+    fail_counts = {sub_key: 1}
+
+    await runner._send_kanban_notification(
+        adapter, sub, "fallback", {}, event=ev, task=task,
+        claimed_cursor=3, old_cursor=1, sub_key=sub_key,
+        sub_fail_counts=fail_counts, max_failures=3,
+    )
+    await _drain_wakes(runner)
+
+    assert adapter.calls == [("123", "done reply", None)]
+    assert unsubs == [("t_done", None)]
+    assert sub_key not in fail_counts  # reset on success
 
 
 # ---------------------------------------------------------------------------
@@ -379,9 +588,11 @@ async def test_direct_notification_mirrors_into_origin_session(monkeypatch):
 async def test_wake_serializes_via_handle_message_lock(monkeypatch):
     """Serialization against the active origin turn is preserved — but it lives
     INSIDE the wake's ``_handle_message`` (which acquires the per-session lock),
-    NOT in the notifier. So a wake whose turn needs the lock waits while it's
-    held, then proceeds once released. (On the old code the notifier held the
-    lock around the wake, so this same turn would self-deadlock and hang.)"""
+    NOT in the notifier. The notifier itself no longer blocks: it dispatches the
+    wake in the background and returns immediately, so the wait-on-the-held-lock
+    happens in the background task. Nothing is delivered until the lock frees;
+    then the queued wake proceeds. (On the old inline-await code the notifier
+    held the lock around the wake, so this same turn would self-deadlock.)"""
     monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "synthesize")
     runner = object.__new__(GatewayRunner)
     runner._conversation_locks = {}
@@ -404,21 +615,25 @@ async def test_wake_serializes_via_handle_message_lock(monkeypatch):
 
     monkeypatch.setattr(runner, "_handle_message", fake_handle_message)
 
-    task = asyncio.create_task(
+    # The notifier call returns immediately even while the lock is held — it is
+    # NOT blocked by the front-desk turn.
+    await asyncio.wait_for(
         runner._send_kanban_notification(
             adapter, sub, "direct fallback", {"thread_id": "7"},
             event=SimpleNamespace(kind="completed", payload={"summary": "h"}),
-        )
+        ),
+        timeout=2,
     )
     await asyncio.sleep(0)
 
-    # The wake's turn is waiting on the held lock — nothing delivered yet.
+    # The background wake's turn is waiting on the held lock — nothing delivered.
     assert adapter.calls == []
     assert not wake_done.is_set()
 
     lock.release()
-    await asyncio.wait_for(task, timeout=2)
+    await _drain_wakes(runner)
 
+    assert wake_done.is_set()
     assert adapter.calls == [("123", "synth after native", {"thread_id": "7"})]
 
 
@@ -529,3 +744,92 @@ def test_kanban_notifier_env_override(monkeypatch):
 
     monkeypatch.setenv("HERMES_KANBAN_NOTIFY_IN_GATEWAY", "true")
     assert runner._kanban_notify_in_gateway_enabled() is True
+
+
+# ---------------------------------------------------------------------------
+# End-to-end watcher tick: real board DB, synthesize completion -> wake
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_watcher_dispatches_wake_without_artifact_double_upload(monkeypatch, tmp_path):
+    """One real notifier tick over a seeded board: a completed task in synthesize
+    mode dispatches the origin wake in the background (non-blocking), the watcher
+    does NOT also upload artifacts (the woken agent owns them), and the terminal
+    subscription is unsubscribed by the background task once the wake succeeds —
+    not synchronously by the watcher (so a failed wake could still retry)."""
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFY_MODE", "synthesize")
+    kb.init_db()
+
+    artifact = tmp_path / "report.txt"
+    artifact.write_text("deliverable")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="investigate X", assignee="orchestrator")
+        kb.recompute_ready(conn)
+        kb.complete_task(conn, tid, summary=f"All done. See {artifact}")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="123", user_id="u1",
+        )
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._conversation_locks = {}
+    runner._kanban_notifier_profile = "default"
+    adapter = _Adapter(SendResult(success=True, message_id="m1"))
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    monkeypatch.setattr(runner, "_kanban_notify_in_gateway_enabled", lambda: True)
+
+    async def fake_handle_message(event):
+        return "Here's what I found."
+
+    monkeypatch.setattr(runner, "_handle_message", fake_handle_message)
+
+    artifact_calls = []
+
+    async def record_artifacts(**kwargs):
+        artifact_calls.append(kwargs)
+
+    monkeypatch.setattr(runner, "_deliver_kanban_artifacts", record_artifacts)
+
+    # No real waiting: skip the watcher's startup delay + inter-tick sleeps.
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_seconds):
+        await real_sleep(0)
+
+    monkeypatch.setattr("gateway.kanban_notifier.asyncio.sleep", fast_sleep)
+
+    # Stop the watcher after it has processed the first delivery, so it doesn't
+    # busy-spin once sleeps are no-ops.
+    real_send = runner._send_kanban_notification
+
+    async def stopping_send(*args, **kwargs):
+        await real_send(*args, **kwargs)
+        runner._running = False
+
+    monkeypatch.setattr(runner, "_send_kanban_notification", stopping_send)
+
+    watcher = asyncio.create_task(runner._kanban_notifier_watcher(interval=1))
+    try:
+        await asyncio.wait_for(watcher, timeout=5)
+    finally:
+        runner._running = False
+        if not watcher.done():
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+
+    # The background wake delivers the synthesized reply to the origin chat.
+    await _drain_wakes(runner)
+    assert adapter.calls == [("123", "Here's what I found.", None)]
+    # Artifact upload is the woken agent's job in synthesize mode — the watcher
+    # must not double-deliver it.
+    assert artifact_calls == []
+    # The done task's subscription is gone — unsubscribed by the wake task.
+    with kb.connect() as conn:
+        assert kb.list_notify_subs(conn) == []

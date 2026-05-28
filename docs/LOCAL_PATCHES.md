@@ -54,8 +54,8 @@ test coverage lives — so the divergence stays legible across upstream merges.
 
 | # | Area | Commit(s) | Test coverage |
 |---|------|-----------|---------------|
-| 1 | Kanban origin-return + notification modes (`direct`/`synthesize`/`silent`) | `be4900d9d`, `0a75a7315` | `tests/gateway/test_kanban_notifier.py`, `tests/tools/test_kanban_tools.py` (+ `tests/local/`) |
-| 2 | Kanban completion **synthesis**, extracted into `KanbanSynthesisMixin` | `39a5bf9ff` | `tests/gateway/test_kanban_notifier.py` (+ `tests/local/gateway/`) |
+| 1 | Kanban origin-return + notification modes — **delivery reworked, see #21** (mode now config-resolved; sub mode/origin columns vestigial for delivery) | `be4900d9d`, `0a75a7315` | `tests/gateway/test_kanban_notifier.py`, `tests/tools/test_kanban_tools.py` (+ `tests/local/`) |
+| 2 | Kanban completion delivery in `KanbanSynthesisMixin` — **gateway-side LLM synthesis removed, replaced by origin-session wake (#21)** | `39a5bf9ff` | `tests/local/gateway/test_kanban_notifier.py` |
 | 3 | Full handoff summary in the completed event (no first-line/400-char cap) | `39a5bf9ff`, `3592c3510` | `tests/hermes_cli/test_kanban_core_functionality.py` |
 | 4 | Fork-local notify-sub schema guards (idempotent ALTERs for the 5 origin/mode columns) | `3592c3510`, `7ee088258` | `tests/tools/test_kanban_tools.py` |
 | 5 | Kanban lifecycle recovery hardening (heartbeat/claim/stale-run/audit) | `380eec386` | `tests/hermes_cli/test_kanban_db.py` (+ `tests/local/`) |
@@ -74,6 +74,7 @@ test coverage lives — so the divergence stays legible across upstream merges.
 | 18 | Re-applied CVE security pins dropped by the v2026.5.16 merge | `84ceb225c` | _none dedicated_ (lockfile/pin change) |
 | 19 | `tests/local/` extraction (merge-pain reduction) | `894daa376` | _test-organization meta_ |
 | 20 | Notify-subscription upsert (re-subscribe updates mode/origin; no cursor reset) | `c653c8881` | `tests/local/hermes_cli/test_kanban_db.py` |
+| 21 | Decompose-anchor + wake-origin-session delivery redesign (supersedes the synthesis half of #1/#2) | `417e21530`, `8964a887a`, `baf695a16`, `b60229dec` | `tests/local/gateway/test_kanban_notifier.py`, `tests/local/hermes_cli/test_kanban_decompose_selfpark_db.py`, `tests/local/tools/test_kanban_decompose_tool.py`, `tests/local/agent/test_kanban_orchestrator_guidance.py` |
 
 ---
 
@@ -192,6 +193,51 @@ delivery cursor (`last_event_id`) or `created_at`. Ported from the retired
 `agent-driven-kanban-orchestration` branch (task t_cd8321e9); that branch's
 other change (per-origin conversation locks) was already in deploy.
 Key file: `hermes_cli/kanban_db.py`.
+
+### 21. Decompose-anchor + wake-origin-session delivery (`417e21530`, `8964a887a`, `baf695a16`, `b60229dec`)
+Reworks the kanban completion-delivery path designed in
+`docs/plans/2026-05-28-kanban-wake-origin-session.md` (the response to upstream
+PR #21523 being closed). Two primitives, both on existing machinery:
+
+- **`kanban_decompose` self-park (Path A).** Generalizes upstream
+  `decompose_triage_task` with an opt-in `allow_running` flag so an orchestrator
+  can fan out *its own* in-flight task and park it as the fan-in **anchor**
+  (`running → todo`, run ended via `_end_run(outcome="decomposed")`, task-level
+  claim cleared so the clean worker exit isn't a protocol violation). The anchor
+  re-promotes and re-dispatches the orchestrator once all children finish, to
+  judge/aggregate. Exposed as the `kanban_decompose` model tool; the
+  kanban-orchestrator skill + `KANBAN_GUIDANCE` now prefer it over
+  create-then-complete. Key files: `hermes_cli/kanban_db.py`,
+  `tools/kanban_tools.py`, `toolsets.py`, `agent/prompt_builder.py`,
+  `skills/devops/kanban-orchestrator/SKILL.md`.
+- **Wake-origin-session delivery.** Replaces the gateway-side LLM synthesis
+  (the whole apparatus deleted from `gateway/kanban_synthesis.py`, 574→~280
+  lines) with `_wake_origin_session`: a `synthesize`-mode completion re-enters
+  the worker handoff into the origin gateway session as a synthetic
+  `internal=True` turn via `_handle_message` (the proven `_process_handoff`
+  pattern), so the origin profile composes/delivers the reply through the normal
+  agent loop — no second rendering engine. `_wake_with_fallback` bounds the wake
+  by `kanban.notify.wake_timeout_seconds` and falls back to the direct status
+  line on error/timeout. Key files: `gateway/kanban_synthesis.py`,
+  `gateway/kanban_notifier.py`.
+
+**Delivery mode is now operator policy, not a per-task column.**
+`_resolve_kanban_notify_mode` reads `HERMES_KANBAN_NOTIFY_MODE` env >
+`kanban.notify.<platform>.mode` > `kanban.notify.mode` > a built-in default that
+preserves the prior Telegram→`synthesize` default (so deploy does **not** regress
+without config). The five `kanban_notify_subs` origin/mode columns (#1/#4) are
+now **vestigial for delivery** — kept in-schema for back-compat, no longer read
+to decide delivery, removing the footgun of a model setting `silent` on a
+user-visible task. The notifier also skips watcher artifact delivery in
+`synthesize` mode (the woken agent surfaces artifacts itself).
+
+> **Live-verification gap.** All paths are unit-verified with fakes
+> (`_handle_message`/adapter/config); the real Telegram round-trip and the full
+> live `decompose → park → re-dispatch → aggregate → wake → deliver` loop are
+> **not** exercised by the suite. Smoke-test one real kanban task after deploy.
+> **Upstream-PR prep (deferred):** dropping the vestigial columns (schema
+> collapse to upstream-identical) and Path-B (front-desk aggregation) remain
+> future work per the design doc.
 
 ### 6 & 7. Orchestrator 3-layer routing + benchmark (`95757a2c3`, `13c1fc21e`)
 **Routing guard:** a `create` from the default front-desk profile must use

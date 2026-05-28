@@ -382,3 +382,49 @@ def render_login_html(*, next_path: str = "") -> str:
             f'Sign in with {html.escape(p.display_name)}</a>'
         )
     return _LOGIN_HTML_TEMPLATE.format(provider_buttons="\n".join(buttons))
+
+
+def render_password_html(
+    *, display_name: str, state: str, error: bool = False
+) -> str:
+    """Return the HTML for the ``/auth/password`` passcode form.
+
+    Rendered for providers that declare ``password_login = True`` (e.g. the
+    bundled ``local`` shared-passcode provider) — there's no external IDP to
+    bounce to, so the operator types a passcode here instead. Reuses the
+    /login page chrome and CSS so the two pages look like one flow.
+
+    ``state`` is the CSRF nonce the provider stashed in the pkce cookie; it's
+    echoed back as a hidden field and re-validated by the POST handler. The
+    form POSTs (not GETs) so the passcode never lands in a URL / server log.
+    """
+    # Reuse the provider-btn surface for the submit button; add a matching
+    # dark input. Single curly braces would collide with str.format on the
+    # shared template, so this fragment is plain (already-substituted) HTML.
+    input_style = (
+        "display:block;width:100%;box-sizing:border-box;padding:0.95rem 1rem;"
+        "margin-bottom:0.75rem;background:color-mix(in srgb,#ffffff 4%,"
+        "var(--background-base));color:var(--foreground);border:1px solid "
+        "var(--hairline-strong);border-radius:0;font-family:'Collapse',"
+        "sans-serif;font-size:0.95rem;letter-spacing:0.04em;"
+    )
+    error_html = (
+        '      <p style="margin:0 0 0.75rem;color:#ff6b6b;font-size:0.82rem;'
+        'letter-spacing:0.06em;text-transform:uppercase;">'
+        'Incorrect passcode — try again.</p>\n'
+        if error
+        else ""
+    )
+    form = (
+        '      <form method="post" action="/auth/password" '
+        'autocomplete="off">\n'
+        f'{error_html}'
+        f'        <input type="password" name="code" placeholder="Passcode" '
+        f'aria-label="Passcode" autofocus required style="{input_style}">\n'
+        f'        <input type="hidden" name="state" '
+        f'value="{html.escape(state, quote=True)}">\n'
+        f'        <button type="submit" class="provider-btn">'
+        f'Sign in with {html.escape(display_name)}</button>\n'
+        '      </form>'
+    )
+    return _LOGIN_HTML_TEMPLATE.format(provider_buttons=form)

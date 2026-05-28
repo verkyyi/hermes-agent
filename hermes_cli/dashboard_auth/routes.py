@@ -368,6 +368,134 @@ def _validate_post_login_target(raw: str) -> str:
     return decoded
 
 
+# ---------------------------------------------------------------------------
+# Public: passcode form (providers that declare ``password_login = True``)
+# ---------------------------------------------------------------------------
+#
+# Some providers (e.g. the bundled ``local`` shared-passcode gate) have no
+# external IDP to redirect to. Their ``start_login`` returns a relative
+# redirect to ``/auth/password`` and stashes a CSRF ``state`` nonce in the
+# pkce cookie. This page renders a passcode form; the POST validates the
+# nonce and hands the passcode to ``complete_login`` as the ``code``. The
+# whole exchange reuses the existing pkce-cookie + session-cookie plumbing,
+# so it slots in next to the OAuth round trip without touching it.
+
+
+def _pkce_parts(request: Request) -> dict:
+    """Parse the ``provider=...;state=...;...`` pkce cookie into a dict."""
+    raw = read_pkce_cookie(request) or ""
+    return dict(seg.split("=", 1) for seg in raw.split(";") if "=" in seg)
+
+
+def _password_provider(request: Request):
+    """Resolve the in-flight password provider from the pkce cookie.
+
+    Returns ``(provider, parts)`` or ``(None, parts)`` when the cookie is
+    missing / names an unknown or non-password provider.
+    """
+    parts = _pkce_parts(request)
+    p = get_provider(parts.get("provider", ""))
+    if p is None or not getattr(p, "password_login", False):
+        return None, parts
+    return p, parts
+
+
+@router.get("/auth/password", name="auth_password_form")
+async def auth_password_form(request: Request, error: int = 0):
+    from hermes_cli.dashboard_auth.login_page import render_password_html
+
+    p, parts = _password_provider(request)
+    if p is None:
+        # No login in flight (or wrong provider) — start over from /login.
+        prefix = _prefix(request)
+        return RedirectResponse(url=f"{prefix}/login", status_code=302)
+    return HTMLResponse(
+        render_password_html(
+            display_name=p.display_name,
+            state=parts.get("state", ""),
+            error=bool(error),
+        ),
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
+
+
+@router.post("/auth/password", name="auth_password_submit")
+async def auth_password_submit(request: Request):
+    from hermes_cli.dashboard_auth.base import InvalidCodeError, ProviderError
+
+    p, parts = _password_provider(request)
+    prefix = _prefix(request)
+    if p is None:
+        return RedirectResponse(url=f"{prefix}/login", status_code=302)
+
+    # Parse the urlencoded body without depending on python-multipart:
+    # starlette's request.form() requires it even for urlencoded bodies.
+    from urllib.parse import parse_qs
+
+    raw = (await request.body()).decode("utf-8", "replace")
+    form = parse_qs(raw, keep_blank_values=True)
+    submitted_state = (form.get("state", [""]) or [""])[0]
+    passcode = (form.get("code", [""]) or [""])[0]
+
+    expected_state = parts.get("state", "")
+    if not expected_state or submitted_state != expected_state:
+        audit_log(
+            AuditEvent.LOGIN_FAILURE,
+            provider=p.name,
+            reason="state_mismatch",
+            ip=_client_ip(request),
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Passcode form state mismatch (CSRF check failed)",
+        )
+
+    try:
+        session = p.complete_login(
+            code=passcode,
+            state=submitted_state,
+            code_verifier=parts.get("verifier", ""),
+            redirect_uri=_redirect_uri(request),
+        )
+    except InvalidCodeError:
+        audit_log(
+            AuditEvent.LOGIN_FAILURE,
+            provider=p.name,
+            reason="invalid_passcode",
+            ip=_client_ip(request),
+        )
+        # Re-render the form with an error. The pkce cookie (and its state)
+        # is still valid, so the retry POSTs the same nonce.
+        return RedirectResponse(
+            url=f"{prefix}/auth/password?error=1", status_code=302
+        )
+    except ProviderError as e:
+        raise HTTPException(status_code=503, detail=f"Provider error: {e}")
+
+    audit_log(
+        AuditEvent.LOGIN_SUCCESS,
+        provider=p.name,
+        user_id=session.user_id,
+        email=session.email,
+        org_id=session.org_id,
+        ip=_client_ip(request),
+    )
+
+    expires_in = max(60, session.expires_at - int(time.time()))
+    landing = _validate_post_login_target(parts.get("next", "")) or "/"
+    resp = RedirectResponse(url=landing, status_code=302)
+    set_session_cookies(
+        resp,
+        access_token=session.access_token,
+        refresh_token=session.refresh_token,
+        access_token_expires_in=expires_in,
+        use_https=detect_https(request),
+        prefix=_prefix(request),
+    )
+    clear_pkce_cookie(resp, prefix=_prefix(request))
+    return resp
+
+
 @router.post("/auth/logout", name="auth_logout")
 async def auth_logout(request: Request):
     _at, rt = read_session_cookies(request)

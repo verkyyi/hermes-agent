@@ -12,7 +12,7 @@ merge. Details live in the code and the listed commits, not here.
 ## Kanban delegation & delivery
 - **Completion delivery & origin-return** — returns a worker's result to the requesting surface; delivery mode is operator policy (default Telegram→`synthesize`, which re-enters the handoff as a normal origin-session turn); `kanban_decompose` parks the orchestrator's task as the fan-in anchor. Design: `docs/plans/2026-05-28-kanban-wake-origin-session.md`. (`be4900d9d, 0a75a7315, 39a5bf9ff, c653c8881, 417e21530, b60229dec`)
 - **Origin-return reliability** — the wake runs outside the conversation lock and as a non-blocking background task; a completing router propagates its subscription to delegated children; create-then-complete is parked as the anchor. (`3849a3663, 12ddd3bd2, e38ecbf47, 33e6526cf`)
-- **DB WAL-corruption prevention** — caps `kanban.max_spawn`=4, enables `PRAGMA checkpoint_fullfsync`, dedups corrupt-DB backups; fixes the 2026-05-27 checkpoint tear. (`82aa0f767`)
+- **DB WAL-corruption prevention** — lowers the default `kanban.max_spawn` to 4 (**deploy config overrides to 20**, so the active guards are the other two), enables `PRAGMA checkpoint_fullfsync`, and dedups corrupt-DB backups; fixes the 2026-05-27 checkpoint tear. (`82aa0f767`)
 - **Lifecycle recovery + sticky-block** — hardens heartbeat/claim/stale-run/audit; permanent preflight failures park (sticky `blocked`) instead of respawning every tick. (`380eec386, b2301c4d1`)
 - **Full handoff summary** — completed-event summary and rendered handoff are no longer truncated. (`39a5bf9ff, 3592c3510`)
 - **Notify-sub column guards** — idempotent ALTERs backfill five fork-local columns upstream lacks; **preserve across merges** until PR #21523 lands. (`3592c3510, 7ee088258`)

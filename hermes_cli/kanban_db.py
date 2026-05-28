@@ -2322,7 +2322,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
-def recompute_ready(conn: sqlite3.Connection) -> int:
+def recompute_ready(conn: sqlite3.Connection, *, failure_limit: int = None) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
@@ -2336,7 +2336,13 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
     ``review-required`` handoff would auto-respawn, the fresh worker
     would find nothing to do, exit cleanly, get recorded as a protocol
     violation, and the cycle would repeat indefinitely.
+
+    ``failure_limit`` bounds circuit-breaker auto-recovery; see the inline
+    comment below.  Defaults to the dispatcher value (the dispatcher threads
+    ``kanban.failure_limit``), else ``DEFAULT_FAILURE_LIMIT``.
     """
+    if failure_limit is None:
+        failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
@@ -2351,6 +2357,43 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
                 continue
+            if cur_status == "blocked":
+                # Bound circuit-breaker auto-recovery.  A ``gave_up`` block
+                # is meant to recover automatically once conditions change
+                # (transient infra error clears, a parent completes).  But a
+                # task that fails *deterministically* never changes: each
+                # revive resets ``consecutive_failures`` and respawns the
+                # same failure, so for a task with no incomplete parent to
+                # wait on this is an infinite respawn loop.  The breaker trips
+                # after ``failure_limit`` consecutive failures; reuse that same
+                # threshold to also bound how many times we revive across
+                # trips.  Each trip emits one ``gave_up`` event, so once the
+                # lifetime trip count reaches the limit, stop reviving and
+                # convert it to a *sticky* block (the same kind an explicit
+                # ``kanban_block`` writes) so it parks for a human instead of
+                # respawning forever.  A task that trips fewer times before
+                # succeeding never reaches the limit, so transient
+                # auto-recovery is preserved.
+                trips = conn.execute(
+                    "SELECT COUNT(*) FROM task_events "
+                    "WHERE task_id = ? AND kind = 'gave_up'",
+                    (task_id,),
+                ).fetchone()[0]
+                if trips >= failure_limit:
+                    _append_event(
+                        conn, task_id, "blocked",
+                        {
+                            "reason": (
+                                f"auto-recovery exhausted: circuit breaker "
+                                f"tripped {trips} times (limit {failure_limit}) "
+                                f"without success; parked for manual review"
+                            ),
+                            "auto_recover_exhausted": True,
+                            "trips": trips,
+                            "failure_limit": failure_limit,
+                        },
+                    )
+                    continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
@@ -5265,7 +5308,7 @@ def dispatch_once(
     if _crash_auto_blocked:
         result.auto_blocked.extend(_crash_auto_blocked)
     result.timed_out = enforce_max_runtime(conn)
-    result.promoted = recompute_ready(conn)
+    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full

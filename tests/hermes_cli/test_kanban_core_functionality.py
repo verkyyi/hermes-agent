@@ -246,6 +246,65 @@ def test_per_task_max_retries_overrides_dispatcher_limit(kanban_home, all_assign
         conn.close()
 
 
+def test_circuit_breaker_auto_recovery_is_bounded(kanban_home, all_assignees_spawnable):
+    """A deterministically failing task must not respawn forever.
+
+    ``recompute_ready`` auto-recovers circuit-breaker (``gave_up``) blocks so a
+    task blocked by a *transient* cause resumes once conditions change. But a
+    task that fails identically on every attempt has no incomplete parent to
+    wait on, so each revive just resets the failure counter and respawns the
+    same failure — an infinite loop. After it has tripped the breaker
+    ``failure_limit`` times the task must instead be parked as a *sticky* block
+    for a human. The cap reuses the configurable ``failure_limit`` (here passed
+    explicitly; the dispatcher threads ``kanban.failure_limit``).
+    """
+    limit = 2
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="always-fails", assignee="worker")
+        kb.recompute_ready(conn, failure_limit=limit)  # todo -> ready (no parents)
+
+        def trip_breaker():
+            # Mirror the spawn-failure path: claim -> fail with limit 1 so the
+            # breaker trips on this attempt and emits one ``gave_up`` event.
+            assert kb.claim_task(conn, tid) is not None
+            kb._record_task_failure(
+                conn, tid, error="deterministic boom",
+                outcome="spawn_failed", failure_limit=1,
+                release_claim=True, end_run=False,
+            )
+            assert kb.get_task(conn, tid).status == "blocked"
+
+        # The first limit-1 trips are treated as possibly-transient: each one is
+        # a ``gave_up`` (not sticky) and ``recompute_ready`` revives the task.
+        for _ in range(limit - 1):
+            trip_breaker()
+            assert not kb._has_sticky_block(conn, tid)
+            assert kb.recompute_ready(conn, failure_limit=limit) == 1
+            assert kb.get_task(conn, tid).status == "ready"
+
+        # The trip that reaches the limit exhausts auto-recovery.
+        trip_breaker()
+        assert kb.recompute_ready(conn, failure_limit=limit) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb._has_sticky_block(conn, tid)
+
+        events = kb.list_events(conn, tid)
+        blocked_evts = [e for e in events if e.kind == "blocked"]
+        assert blocked_evts, "exhausting auto-recovery must emit a sticky 'blocked' event"
+        assert blocked_evts[-1].payload.get("auto_recover_exhausted") is True
+        assert blocked_evts[-1].payload.get("trips") == limit
+        assert blocked_evts[-1].payload.get("failure_limit") == limit
+
+        # Regression for the respawn loop: further dispatcher ticks must never
+        # revive it — it stays parked until an explicit unblock.
+        for _ in range(5):
+            assert kb.recompute_ready(conn, failure_limit=limit) == 0
+            assert kb.get_task(conn, tid).status == "blocked"
+    finally:
+        conn.close()
+
+
 def test_per_task_max_retries_allows_more_than_default(kanban_home, all_assignees_spawnable):
     """A task with ``max_retries=5`` does NOT auto-block at the default
     limit of 2 — it must reach the per-task override first."""

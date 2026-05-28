@@ -101,7 +101,7 @@ def test_record_span_event_and_stage_summary(tmp_path):
     stage_names = {row["name"] for row in summary["spans"]}
     assert {"queue.wait", "adapter.send.telegram"} <= stage_names
     text = format_metrics_summary(store=store)
-    assert "span/stage" in text
+    assert "Spans" in text
     assert "queue.wait" in text
 
 
@@ -168,6 +168,6 @@ def test_request_mix_and_async_kanban_correlation_summary(tmp_path):
     assert {"queue.wait", "worker.run", "kanban.synthesis"} <= stage_names
 
     text = format_metrics_summary(store=store)
-    assert "request mix" in text
-    assert "async kanban" in text
+    assert "Request mix" in text
+    assert "Async kanban" in text
     assert "TTLT_async" in text

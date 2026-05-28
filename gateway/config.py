@@ -1016,6 +1016,18 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["TELEGRAM_IGNORED_THREADS"] = str(ignored_threads)
                 if "reactions" in telegram_cfg and not os.getenv("TELEGRAM_REACTIONS"):
                     os.environ["TELEGRAM_REACTIONS"] = str(telegram_cfg["reactions"]).lower()
+                # Per-outcome reaction emoji overrides. An explicit empty value
+                # ("" or YAML null) means "clear the reaction" rather than set
+                # one — e.g. reaction_success: "" stops a completed turn from
+                # leaving a repetitive 👍 on every message.
+                for _react_key, _react_env in (
+                    ("reaction_progress", "TELEGRAM_REACTION_PROGRESS"),
+                    ("reaction_success", "TELEGRAM_REACTION_SUCCESS"),
+                    ("reaction_failure", "TELEGRAM_REACTION_FAILURE"),
+                ):
+                    if _react_key in telegram_cfg and not os.getenv(_react_env):
+                        _react_val = telegram_cfg[_react_key]
+                        os.environ[_react_env] = "" if _react_val is None else str(_react_val)
                 if "proxy_url" in telegram_cfg and not os.getenv("TELEGRAM_PROXY"):
                     os.environ["TELEGRAM_PROXY"] = str(telegram_cfg["proxy_url"]).strip()
                 # reply_to_mode: top-level preferred, falls back to extra.reply_to_mode
@@ -1246,9 +1258,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         config.platforms[Platform.TELEGRAM].enabled = True
         config.platforms[Platform.TELEGRAM].token = telegram_token
     
-    # Reply threading mode for Telegram (off/first/all)
+    # Reply threading mode for Telegram (off/first/all/smart)
     telegram_reply_mode = os.getenv("TELEGRAM_REPLY_TO_MODE", "").lower()
-    if telegram_reply_mode in {"off", "first", "all"}:
+    if telegram_reply_mode in {"off", "first", "all", "smart"}:
         if Platform.TELEGRAM not in config.platforms:
             config.platforms[Platform.TELEGRAM] = PlatformConfig()
         config.platforms[Platform.TELEGRAM].reply_to_mode = telegram_reply_mode

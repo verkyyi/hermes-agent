@@ -8,6 +8,7 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 import dataclasses
 import json
@@ -430,6 +431,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._webhook_mode: bool = False
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
+        # Most-recent inbound message id per chat, used by reply_to_mode="smart"
+        # to tell an in-order reply from an out-of-band one. Bounded so a busy
+        # bot touching many chats can't grow it without limit.
+        self._last_inbound_message_id: "OrderedDict[str, str]" = OrderedDict()
+        self._last_inbound_max_chats = 2048
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
         # Buffer rapid/album photo updates so Telegram image bursts are handled
         # as a single MessageEvent instead of self-interrupting multiple turns.
@@ -1858,12 +1864,64 @@ class TelegramAdapter(BasePlatformAdapter):
         self._bot = None
         logger.info("[%s] Disconnected from Telegram", self.name)
 
-    def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
+    def _is_one_to_one_dm(self, chat_id: Optional[str], thread_id: Optional[str]) -> bool:
+        """True for a Telegram private 1:1 chat with no topic/thread lane.
+
+        Telegram private chats carry a positive ``chat_id`` (equal to the user
+        id); groups, supergroups and channels use negative ids. A ``thread_id``
+        means a topic lane, where reply-anchoring keeps the answer attached to
+        the lane — so that is treated as not-1:1.
+        """
+        if thread_id:
+            return False
+        try:
+            return int(str(chat_id)) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def _reply_is_out_of_band(self, chat_id: Optional[str], reply_to: str) -> bool:
+        """True if newer inbound messages arrived after the one being answered.
+
+        Compares the reply anchor against the most-recent inbound message id
+        seen for this chat. When they differ, the reply could be ambiguous
+        (follow-ups landed while the agent was working), so a quote helps the
+        user see which message it addresses. An unknown last-inbound id is
+        treated as in-order (no quote).
+        """
+        last = getattr(self, "_last_inbound_message_id", {}).get(str(chat_id))
+        return last is not None and str(last) != str(reply_to)
+
+    def _record_inbound_message(self, chat_id: str, message_id: str) -> None:
+        """Record the latest inbound message id for a chat (smart-mode anchor).
+
+        Bounded LRU-ish: re-insert moves the chat to the most-recent end and the
+        oldest entry is evicted past the cap, so a bot touching many chats can't
+        grow this map without limit.
+        """
+        store = getattr(self, "_last_inbound_message_id", None)
+        if store is None:
+            return
+        store.pop(chat_id, None)
+        store[chat_id] = message_id
+        cap = getattr(self, "_last_inbound_max_chats", 2048)
+        while len(store) > cap:
+            store.popitem(last=False)
+
+    def _should_thread_reply(
+        self,
+        reply_to: Optional[str],
+        chunk_index: int,
+        chat_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> bool:
         """Determine if this message chunk should thread to the original message.
 
         Args:
             reply_to: The original message ID to reply to
             chunk_index: Index of this chunk (0 = first chunk)
+            chat_id: Destination chat id (used by "smart" mode to tell a 1:1
+                DM from a group)
+            thread_id: Topic/thread lane id, if any (used by "smart" mode)
 
         Returns:
             True if this chunk should be threaded to the original message
@@ -1873,10 +1931,20 @@ class TelegramAdapter(BasePlatformAdapter):
         mode = self._reply_to_mode
         if mode == "off":
             return False
-        elif mode == "all":
+        if mode == "all":
             return True
-        else:  # "first" (default)
+        if mode == "smart":
+            # In a linear 1:1 DM the answer is unambiguous, so quoting every
+            # reply is noise — suppress it unless newer messages have arrived
+            # since the one being answered. Groups and topic lanes quote the
+            # first chunk so it is clear which message the reply addresses.
+            if self._is_one_to_one_dm(chat_id, thread_id) and not self._reply_is_out_of_band(
+                chat_id, reply_to
+            ):
+                return False
             return chunk_index == 0
+        # "first" (default) and any unknown mode
+        return chunk_index == 0
 
     async def send(
         self,
@@ -1955,7 +2023,9 @@ class TelegramAdapter(BasePlatformAdapter):
                         and self._reply_to_mode != "off"
                     )
                 else:
-                    should_thread = self._should_thread_reply(reply_to_source, i)
+                    should_thread = self._should_thread_reply(
+                        reply_to_source, i, chat_id=chat_id, thread_id=thread_id
+                    )
                 reply_to_id = int(reply_to_source) if should_thread and reply_to_source else None
                 if private_dm_topic_send and reply_to_id is None and not dm_topic_reply_to_off:
                     return SendResult(
@@ -5857,6 +5927,10 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
+        # Track the most-recent inbound message per chat for reply_to_mode="smart"
+        # out-of-band detection.
+        self._record_inbound_message(_chat_id_str, str(message.message_id))
+
         return MessageEvent(
             text=message.text or "",
             message_type=msg_type,
@@ -5873,9 +5947,42 @@ class TelegramAdapter(BasePlatformAdapter):
 
     # ── Message reactions (processing lifecycle) ──────────────────────────
 
+    # Processing-lifecycle reaction slots → (env override, default emoji).
+    #
+    # Defaults match upstream (👀 → 👍 / 👎) so behavior is unchanged out of the
+    # box. Each slot is overridable per-deployment via its env var, and an empty
+    # value means "clear any existing reaction" instead of setting one — e.g.
+    # TELEGRAM_REACTION_SUCCESS="" makes a completed turn clear the 👀 rather
+    # than leave a repetitive 👍 on every single message (the reply text is
+    # itself the success signal). config.yaml bridges these (see gateway/config).
+    _REACTION_ENV = {
+        "progress": "TELEGRAM_REACTION_PROGRESS",
+        "success": "TELEGRAM_REACTION_SUCCESS",
+        "failure": "TELEGRAM_REACTION_FAILURE",
+    }
+    _REACTION_DEFAULTS = {
+        "progress": "\U0001f440",  # 👀
+        "success": "\U0001f44d",   # 👍
+        "failure": "\U0001f44e",   # 👎
+    }
+
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
         return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in {"false", "0", "no"}
+
+    def _reaction_emoji(self, slot: str) -> str:
+        """Resolve the emoji for a lifecycle slot (progress/success/failure).
+
+        Returns the configured emoji, or ``""`` meaning "clear any existing
+        reaction instead of setting one". An env override (e.g.
+        ``TELEGRAM_REACTION_SUCCESS``) wins over the built-in default; set it to
+        an empty value to clear, or to an emoji to restore a sticky marker.
+        """
+        env_name = self._REACTION_ENV.get(slot)
+        val = os.getenv(env_name) if env_name else None
+        if val is None:
+            return self._REACTION_DEFAULTS.get(slot, "")
+        return val.strip()
 
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Set a single emoji reaction on a Telegram message."""
@@ -5919,8 +6026,12 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
-        if chat_id and message_id:
-            await self._set_reaction(chat_id, message_id, "\U0001f440")
+        if not (chat_id and message_id):
+            return
+        emoji = self._reaction_emoji("progress")
+        # Empty = no in-progress reaction at all; nothing to clear on start.
+        if emoji:
+            await self._set_reaction(chat_id, message_id, emoji)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction.
@@ -5934,6 +6045,11 @@ class TelegramAdapter(BasePlatformAdapter):
         Without this clear, the only way to remove the 👀 was to wait for
         another agent run to swap it to 👍/👎 — which never happens if the
         cancellation was the last activity in the chat.
+
+        Success and failure emojis come from the configurable slot map
+        (:meth:`_reaction_emoji`). An empty slot clears the reaction instead of
+        setting one — that is the default for success, so a completed turn
+        doesn't leave a repetitive thumbs-up on every message.
         """
         if not self._reactions_enabled():
             return
@@ -5943,9 +6059,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if outcome == ProcessingOutcome.CANCELLED:
             await self._clear_reactions(chat_id, message_id)
+            return
+        slot = "success" if outcome == ProcessingOutcome.SUCCESS else "failure"
+        emoji = self._reaction_emoji(slot)
+        if emoji:
+            await self._set_reaction(chat_id, message_id, emoji)
         else:
-            await self._set_reaction(
-                chat_id,
-                message_id,
-                "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
-            )
+            await self._clear_reactions(chat_id, message_id)

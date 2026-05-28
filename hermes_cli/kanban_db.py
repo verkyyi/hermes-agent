@@ -1444,14 +1444,40 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         notify_cols = {
             row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")
         }
-        # NOTE: notification_mode / origin_session_id / origin_profile /
-        # origin_context / request_id are now part of the base CREATE TABLE
-        # schema above (upstream v0.14.0 / v2026.5.16 picked them up via PR
-        # #21523 → commit be4900d9d). The legacy ALTER-guard block was
-        # removed in the post-v0.14.0 cleanup. notifier_profile is also in
-        # the base schema, but we keep its ALTER guard because legacy DBs
-        # created by older upstream releases predate it and the column is
-        # nullable so the guard is cheap.
+        # notification_mode / origin_session_id / origin_profile /
+        # origin_context / request_id are FORK-LOCAL columns: NousResearch
+        # upstream does not have them. PR #21523 (which would add them to the
+        # upstream base schema) is unmerged — even after the 2026-05-27 catchup
+        # to upstream/main @ 2d5dcfabc, upstream's CREATE TABLE
+        # kanban_notify_subs ships only notifier_profile. They live in *our*
+        # base CREATE TABLE above, but a kanban_notify_subs table first created
+        # by an upstream-schema (or older fork) checkout will lack them, and
+        # CREATE TABLE IF NOT EXISTS is a no-op against an existing table — so
+        # these idempotent guards are the only thing that backfills them. Keep
+        # until PR #21523 actually lands upstream. See docs/LOCAL_PATCHES.md #4.
+        if "notification_mode" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "notification_mode",
+                "notification_mode TEXT NOT NULL DEFAULT 'direct'",
+            )
+        if "origin_session_id" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "origin_session_id", "origin_session_id TEXT"
+            )
+        if "origin_profile" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "origin_profile", "origin_profile TEXT"
+            )
+        if "origin_context" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "origin_context", "origin_context TEXT"
+            )
+        if "request_id" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "request_id", "request_id TEXT"
+            )
         if "notifier_profile" not in notify_cols:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"

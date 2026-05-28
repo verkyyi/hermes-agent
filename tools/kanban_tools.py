@@ -601,6 +601,35 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            # Reliable self-park. If this task is a return-anchor (carries an
+            # origin notify subscription) AND it delegated work to still-pending
+            # children, completing it now would mark the anchor done with only a
+            # routing summary and strand the user's answer on a child that has no
+            # subscription. Instead, re-link it as the fan-in anchor over those
+            # children and park it; it re-wakes to aggregate + complete once they
+            # finish (kanban_decompose self-parks up front; this also catches the
+            # create-children-then-kanban_complete shape that the LLM tends to use).
+            if kb.list_notify_subs(conn, tid):
+                parked = kb.park_as_fanin_anchor(conn, tid)
+                if parked:
+                    if summary or result:
+                        try:
+                            kb.add_comment(
+                                conn, tid,
+                                author=(os.environ.get("HERMES_PROFILE") or "orchestrator"),
+                                body=f"[routing note, pre-park] {summary or result}",
+                            )
+                        except Exception:
+                            pass
+                    return _ok(
+                        task_id=tid, parked=True, fanin_children=parked,
+                        note=(
+                            f"Parked as the fan-in anchor over {parked} child task(s). "
+                            "Do NOT complete now — you'll be re-dispatched on this task once "
+                            "they all finish, to read their handoffs, aggregate, and complete "
+                            "then. That completion is what returns the result to the requester."
+                        ),
+                    )
             try:
                 ok = kb.complete_task(
                     conn, tid,

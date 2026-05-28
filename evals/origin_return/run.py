@@ -138,28 +138,32 @@ def phase_b(task_id: str) -> tuple[bool, str]:
 
     conn = kb.connect()
     try:
-        rows = conn.execute(
-            "SELECT s.task_id AS task_id, t.status AS status "
-            "FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
-            "WHERE s.platform = 'telegram' AND s.chat_id = ?",
-            (CHAT_ID,),
-        ).fetchall()
         anchor = kb.get_task(conn, task_id)
+        subs = kb.list_notify_subs(conn, task_id)
+        parents = kb.parent_ids(conn, task_id)  # work the anchor now waits on
     finally:
         conn.close()
 
-    placements = [(r["task_id"], r["status"]) for r in rows]
-    live = [p for p in placements if p[1] not in ("done", "archived")]
-    if not placements:
-        return False, "origin subscription disappeared entirely — answer can't return"
-    if not live:
+    if anchor is None:
+        return False, "anchor task vanished"
+    has_sub = any(
+        s.get("platform") == "telegram" and s.get("chat_id") == CHAT_ID for s in subs
+    )
+    # Reliable self-park contract: the anchor stays ALIVE (not done), keeps its
+    # origin subscription, and waits on the delegated work (it was re-linked as
+    # the fan-in child of its children). It re-wakes to aggregate + deliver.
+    if anchor.status in ("done", "archived"):
         return False, (
-            f"origin sub only on done/archived task(s) — real answer can't return: "
-            f"{placements} (anchor status={getattr(anchor, 'status', '?')})"
+            f"anchor completed (status={anchor.status}) — did NOT self-park; "
+            "it would deliver a routing non-answer"
         )
+    if not has_sub:
+        return False, f"anchor lost its origin subscription (subs={subs})"
+    if not parents:
+        return False, "anchor is parked but waits on no work (no fan-in linked)"
     return True, (
-        f"return path survives: origin sub on live task {live[0][0]} "
-        f"(status={live[0][1]}); anchor status={getattr(anchor, 'status', '?')}"
+        f"self-parked: anchor status={anchor.status}, waits on {len(parents)} "
+        f"task(s), origin sub retained on the anchor"
     )
 
 

@@ -3258,6 +3258,64 @@ def recover_complete_task(
     return True
 
 
+def park_as_fanin_anchor(conn: sqlite3.Connection, task_id: str) -> int:
+    """Turn a router task that is trying to complete-while-delegating into a
+    fan-in anchor (deterministic self-park).
+
+    An orchestrator typically delegates by creating children gated on itself
+    (``kanban_create(parents=[me])``) and then completing — which marks the
+    subscribed anchor ``done`` with only a routing summary while the children do
+    the real work. To keep the anchor alive as the single return point, REVERSE
+    those gated children (so they run now and the anchor waits on THEM), park the
+    anchor at ``todo``, and end its current run. The origin subscription stays on
+    the anchor; when every child finishes the anchor re-promotes, its assignee is
+    re-dispatched to aggregate, and completing it then delivers the real answer
+    (its children are ``done``, so the completion-time propagation is a no-op).
+
+    Returns the number of children re-linked. Returns 0 (and changes nothing) if
+    the task has no pending children it parents — in that case it is a genuine
+    deliverable and should complete normally.
+    """
+    relinked = 0
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT l.child_id AS id FROM task_links l JOIN tasks t ON t.id = l.child_id "
+            "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived')",
+            (task_id,),
+        ).fetchall()
+        children = [r["id"] for r in rows]
+        if not children:
+            return 0
+        for child in children:
+            # child was gated by the anchor → ungate it (run now); the anchor
+            # becomes a child of `child` so it waits for the whole fan-out.
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (task_id, child),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (child, task_id),
+            )
+            relinked += 1
+        # End the active run so the worker's clean exit is not a protocol
+        # violation, then park: running -> todo, release the claim/pid.
+        _end_run(
+            conn, task_id,
+            outcome="self_parked", status="self_parked",
+            summary="parked as fan-in anchor; awaiting children",
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'todo', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+            (task_id,),
+        )
+        _append_event(conn, task_id, "self_parked", {"children": children})
+    # Children are now parent-free → promote them; the anchor waits on them.
+    recompute_ready(conn)
+    return relinked
+
+
 def _propagate_origin_subs_to_children(conn: sqlite3.Connection, task_id: str) -> int:
     """Move a completing router task's origin notify subscription to its pending
     children so the user's answer returns from the task that holds it.

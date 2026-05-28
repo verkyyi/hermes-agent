@@ -112,60 +112,50 @@ Words like "also," "finally," or "and" do not automatically imply a dependency. 
 
 Show the graph to the user before creating cards. Let them correct it — including which actual profile name should own each lane.
 
-### Step 3 — Create tasks and link
+### Step 3 — Fan out and self-park (`kanban_decompose`)
 
-Use the profile names from Step 0. The example below uses placeholders `<profile-A>`, `<profile-B>`, `<profile-C>` — replace them with what the user actually has.
-
-```python
-t1 = kanban_create(
-    title="research: Postgres cost vs current",
-    assignee="<profile-A>",  # whichever profile handles research on this setup
-    body="Compare estimated infrastructure costs, migration costs, and ongoing ops costs over a 3-year window. Sources: AWS/GCP pricing, team time estimates, current Postgres bills from peers.",
-    tenant=os.environ.get("HERMES_TENANT"),
-)["task_id"]
-
-t2 = kanban_create(
-    title="research: Postgres performance vs current",
-    assignee="<profile-A>",  # same profile, run in parallel
-    body="Compare query latency, throughput, and scaling characteristics at our expected data volume (~500GB, 10k QPS peak). Sources: benchmark papers, public case studies, pgbench results if easy.",
-)["task_id"]
-
-t3 = kanban_create(
-    title="synthesize migration recommendation",
-    assignee="<profile-B>",  # whichever profile does synthesis/analysis
-    body="Read the findings from T1 (cost) and T2 (performance). Produce a 1-page recommendation with explicit trade-offs and a go/no-go call.",
-    parents=[t1, t2],
-)["task_id"]
-
-t4 = kanban_create(
-    title="draft decision memo",
-    assignee="<profile-C>",  # whichever profile drafts user-facing prose
-    body="Turn the analyst's recommendation into a 2-page memo for the CTO. Match the tone of previous decision memos in the team's knowledge base.",
-    parents=[t3],
-)["task_id"]
-```
-
-`parents=[...]` gates promotion — children stay in `todo` until every parent reaches `done`, then auto-promote to `ready`. No manual coordination needed; the dispatcher and dependency engine handle it.
-
-If the task graph has dependencies, create the parent cards first, capture their returned ids, and include those ids in the child card's `parents` list during the child `kanban_create` call. Avoid creating all cards in parallel and linking them afterward; that creates a window where the dispatcher can claim a child before its inputs exist.
-
-### Step 4 — Complete your own task
-
-If you were spawned as a task yourself (e.g. a planner profile was assigned `T0: "investigate Postgres migration"`), mark it done with a summary of what you created:
+Use the profile names from Step 0 (placeholders `<profile-A/B/C>` below — replace with the real ones). Prefer **`kanban_decompose`**: it creates the whole child graph AND parks your own task as their fan-in **anchor** in a single atomic call. `parents` are **0-based indices into the `children` list** (not task ids), so dependencies are expressed inline — no id capture, no create-then-link race.
 
 ```python
-kanban_complete(
-    summary="decomposed into T1-T4: 2 research lanes in parallel, 1 synthesis on their outputs, 1 prose draft on the recommendation",
-    metadata={
-        "task_graph": {
-            "T1": {"assignee": "<profile-A>", "parents": []},
-            "T2": {"assignee": "<profile-A>", "parents": []},
-            "T3": {"assignee": "<profile-B>", "parents": ["T1", "T2"]},
-            "T4": {"assignee": "<profile-C>", "parents": ["T3"]},
-        },
+kanban_decompose(children=[
+    {   # index 0 — runs immediately, in parallel
+        "title": "research: Postgres cost vs current",
+        "assignee": "<profile-A>",
+        "body": "Compare infra/migration/ops costs over a 3-year window. Sources: AWS/GCP pricing, team estimates, peer Postgres bills.",
     },
-)
+    {   # index 1 — runs immediately, in parallel
+        "title": "research: Postgres performance vs current",
+        "assignee": "<profile-A>",
+        "body": "Compare latency/throughput/scaling at ~500GB, 10k QPS peak. Sources: benchmarks, public case studies, pgbench.",
+    },
+    {   # index 2 — fan-in: waits for both research lanes
+        "title": "synthesize migration recommendation",
+        "assignee": "<profile-B>",
+        "body": "Read the cost (lane 0) and performance (lane 1) findings. Produce a 1-page recommendation with explicit trade-offs and a go/no-go call.",
+        "parents": [0, 1],
+    },
+    {   # index 3 — waits for the synthesis
+        "title": "draft decision memo",
+        "assignee": "<profile-C>",
+        "body": "Turn the recommendation into a 2-page CTO memo, matching the tone of the team's prior decision memos.",
+        "parents": [2],
+    },
+])
 ```
+
+`parents` gates promotion — a child stays in `todo` until every listed sibling reaches `done`, then auto-promotes to `ready`. The dispatcher and dependency engine handle all ordering, and `kanban_decompose` writes the graph atomically so there is no window where a child is claimed before its inputs exist.
+
+> Plain `kanban_create(..., parents=[<task_ids>])` is the manual equivalent (there `parents` are task ids captured from prior `kanban_create` calls). Use it only for an ad-hoc single follow-up that doesn't need you to aggregate — for a real fan-out/fan-in, `kanban_decompose` is simpler and self-parks you correctly.
+
+### Step 4 — You are parked; do NOT complete yet
+
+`kanban_decompose` already parked your task as the anchor of the whole graph and ended your current run — **do not call `kanban_complete` now.** When every child finishes, the dispatcher re-dispatches you on this *same* task (a second run). That is when you:
+
+1. read each child's handoff (`kanban_show` on the child ids, or your own `worker_context`),
+2. judge whether the work is actually done, and
+3. either `kanban_decompose` again to spawn follow-up work, or `kanban_complete(summary=..., metadata=...)` with the final aggregated answer.
+
+Completing in the first turn — right after decomposing — is the most common orchestrator mistake: it abandons the anchor, and the children's results never get judged or returned to the requester.
 
 ### Step 5 — Report back to the user
 
@@ -181,7 +171,7 @@ Tell them what you created in plain prose, naming the actual profiles you used:
 
 ## Common patterns
 
-**Fan-out + fan-in (research → synthesize):** N research-style cards with no parents, one synthesis card with all of them as parents.
+**Fan-out + fan-in (research → synthesize):** N research-style children with no parents, one synthesis child listing all of them in `parents`. Issue the whole graph with one `kanban_decompose` call — it self-parks your task as the anchor and re-dispatches you to judge/aggregate once every child is done.
 
 **Parallel implementation + validation:** one implementer card makes the change while one explorer/researcher card verifies config, docs, or source mapping. A reviewer card can depend on both. Do not make the implementer own unrelated verification just because the user mentioned both in one sentence.
 

@@ -1,0 +1,7 @@
+name: local
+version: 1.0.0
+description: "Dashboard auth provider — local shared-passcode gate (no external IDP). Auto-activates when a passcode is configured via either dashboard.local_auth.passcode in config.yaml (canonical surface) or HERMES_DASHBOARD_LOCAL_PASSCODE env var (operator override). Sessions are self-signed HMAC tokens keyed on the passcode, so rotating the passcode invalidates all live sessions. Intended for trusted-LAN binds where the Nous Portal OAuth provider isn't available."
+author: local-patch
+kind: backend
+requires_env:
+  - HERMES_DASHBOARD_LOCAL_PASSCODE

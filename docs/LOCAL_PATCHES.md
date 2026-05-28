@@ -34,7 +34,7 @@ test coverage lives — so the divergence stays legible across upstream merges.
 | 11 | Front-desk UX slimming + explicit-skill policy | `0a75a7315` | `tests/gateway/test_config.py`, skills tests |
 | 12 | Telegram pre-LLM acknowledgement (front-desk responsiveness) | `0a75a7315` | `tests/gateway/test_telegram_pre_llm_ack.py` (+ benchmark #16) |
 | 13 | Segmented agent telemetry (`agent/telemetry.py`) | `0a75a7315` | `tests/test_telemetry.py` |
-| 14 | Break-glass operator escape hatch (`hermes_cli/break_glass.py`) | `0a75a7315` | `tests/hermes_cli/test_break_glass.py` |
+| 14 | Break-glass operator escape hatch (`hermes_cli/break_glass.py`) | `0a75a7315`; CLI wiring moved to plugin `break-glass-cli` | `tests/hermes_cli/test_break_glass.py`, `tests/local/hermes_cli/test_break_glass_cli_plugin.py` |
 | 15 | Google Workspace OAuth setup hardening | `0a75a7315` | `tests/local/skills/test_google_oauth_setup.py` |
 | 16 | Profile-memory dashboard plugin | `ee0334194` | `tests/plugins/test_profile_memory_dashboard_plugin.py` |
 | 17 | Default-profile responsiveness benchmark + live TTFT | `95772b8f5` | `tests/responsiveness_benchmark/` (28 GREEN + 2 `xfail`) |
@@ -247,6 +247,22 @@ ttft/ttfa/ttlt used by the responsiveness benchmark's live mode.
 ### 14. Break-glass (`0a75a7315`)
 `hermes_cli/break_glass.py` — operator escape hatch for recovering stuck
 state.
+
+> **CLI wiring → plugin (`plugins/break-glass-cli/`).** The `hermes break-glass`
+> subcommand was wired by an inline edit in `hermes_cli/main.py` (an `import` +
+> `build_parser(subparsers)` call). That moved into a `break-glass-cli` plugin
+> via `register_cli_command` — `main.py` is now **upstream-identical** (was
+> +7/−0). `break_glass.py` was refactored to expose `configure_parser(parser)`
+> (populates an already-created parser — the plugin `setup_fn` contract) plus
+> `BREAK_GLASS_HELP`/`BREAK_GLASS_DESCRIPTION` constants; `build_parser` stays as
+> a back-compat shim. **Tradeoff — opt-in + swallowed discovery:** plugin CLI
+> commands load only when listed in `plugins.enabled`, and registration runs
+> inside `discover_plugins()` whose failures the CLI swallows. Since break-glass
+> is an emergency tool, **keep `break-glass-cli` enabled** (it is, in deploy
+> config) so the subcommand can't silently vanish when the runtime is degraded.
+> Verified live: `hermes break-glass --help` lists all five actions sourced from
+> the plugin. Tests: `tests/local/hermes_cli/test_break_glass_cli_plugin.py`
+> (parser dispatch, register wiring, real-manager wiring + opt-in gating).
 
 ### 15. Google Workspace OAuth setup (`0a75a7315`)
 Hardening of `skills/productivity/google-workspace/scripts/setup.py` (scope

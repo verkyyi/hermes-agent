@@ -474,16 +474,25 @@ def cmd_break_glass(args: argparse.Namespace) -> int:
     raise SystemExit(f"unknown break-glass action: {action}")
 
 
-def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
-    parser = subparsers.add_parser(
-        "break-glass",
-        help="Local self-repair path for Hermes/Kanban tool-runtime failures",
-        description=(
-            "Deterministic local diagnostics/smoke/repair for cases where the normal "
-            "model tool-dispatch or Kanban worker path is broken. Does not require "
-            "handle_function_call() for orchestration."
-        ),
-    )
+BREAK_GLASS_HELP = "Local self-repair path for Hermes/Kanban tool-runtime failures"
+BREAK_GLASS_DESCRIPTION = (
+    "Deterministic local diagnostics/smoke/repair for cases where the normal "
+    "model tool-dispatch or Kanban worker path is broken. Does not require "
+    "handle_function_call() for orchestration."
+)
+
+
+def configure_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Populate an already-created ``break-glass`` parser with its action
+    subparsers and default handler.
+
+    Takes the parser the caller already created — the plugin CLI dispatch in
+    ``hermes_cli/main.py`` does ``subparsers.add_parser("break-glass", ...)`` and
+    hands the result here as the ``register_cli_command`` ``setup_fn``. Kept
+    separate from parser *creation* so one body satisfies that contract; the
+    command itself now lives in the ``break-glass-cli`` plugin rather than an
+    inline edit in ``main.py`` (see docs/LOCAL_PATCHES.md #14).
+    """
     sub = parser.add_subparsers(dest="break_glass_action")
 
     p_diag = sub.add_parser("diagnose", help="Collect safe local diagnostics")
@@ -510,3 +519,15 @@ def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentPar
 
     parser.set_defaults(func=cmd_break_glass)
     return parser
+
+
+def build_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
+    """Back-compat shim: create the ``break-glass`` subparser and configure it.
+
+    No longer wired from ``main.py`` (the command moved to the ``break-glass-cli``
+    plugin). Retained so any direct caller / test keeps working.
+    """
+    parser = subparsers.add_parser(
+        "break-glass", help=BREAK_GLASS_HELP, description=BREAK_GLASS_DESCRIPTION
+    )
+    return configure_parser(parser)

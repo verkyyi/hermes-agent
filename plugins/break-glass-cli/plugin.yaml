@@ -1,0 +1,4 @@
+name: break-glass-cli
+version: "0.1.0"
+description: "Registers the `hermes break-glass` CLI subcommand (diagnose/smoke/test/verify/repair) via register_cli_command, replacing a fork-local inline edit in hermes_cli/main.py — see docs/LOCAL_PATCHES.md #14. The command body lives in hermes_cli/break_glass.py. OPT-IN: standalone plugins load only when listed in plugins.enabled. Because break-glass is an emergency self-repair tool, keep it enabled so the subcommand is always present."
+author: "NousResearch (Hermes fork — Verky)"

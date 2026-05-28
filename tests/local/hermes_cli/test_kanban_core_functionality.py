@@ -66,19 +66,36 @@ def test_dispatch_preflight_unknown_forced_skill_blocks_without_spawn(
         result = kb.dispatch_once(conn, spawn_fn=fake_spawn)
         task = kb.get_task(conn, tid)
         events = kb.list_events(conn, tid)
+
+        assert tid not in spawned
+        assert tid in result.auto_blocked
+        assert task.status == "blocked"
+        assert "Unknown skill(s): does-not-exist" in task.last_failure_error
+        # A missing forced skill is a *permanent* failure: it must emit a
+        # sticky ``blocked`` event (not ``gave_up``) so the dispatcher cannot
+        # auto-revive it into an infinite respawn loop.
+        block_events = [e for e in events if e.kind == "blocked"]
+        assert block_events
+        payload = block_events[-1].payload
+        assert payload["permanent"] is True
+        assert payload["preflight"] == "skills"
+        assert payload["profile"] == "worker"
+        assert payload["missing_skills"] == ["does-not-exist"]
+        assert not [e for e in events if e.kind == "gave_up"], (
+            "permanent preflight failure must be sticky-blocked, not gave_up"
+        )
+
+        # Regression for the respawn loop: a sticky permanent-failure block
+        # must survive recompute_ready and never be re-spawned.
+        assert kb._has_sticky_block(conn, tid)
+        for _ in range(5):
+            assert kb.recompute_ready(conn) == 0
+            assert kb.get_task(conn, tid).status == "blocked"
+        kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert tid not in spawned, "sticky-blocked task must not be re-spawned"
+        assert kb.get_task(conn, tid).status == "blocked"
     finally:
         conn.close()
-
-    assert tid not in spawned
-    assert tid in result.auto_blocked
-    assert task.status == "blocked"
-    assert "Unknown skill(s): does-not-exist" in task.last_failure_error
-    failure_events = [e for e in events if e.kind == "gave_up"]
-    assert failure_events
-    payload = failure_events[-1].payload
-    assert payload["preflight"] == "skills"
-    assert payload["profile"] == "worker"
-    assert payload["missing_skills"] == ["does-not-exist"]
 
 
 def test_forced_skill_can_resolve_from_default_profile_for_named_worker(

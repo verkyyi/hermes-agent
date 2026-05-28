@@ -5267,6 +5267,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    permanent: bool = False,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -5327,8 +5328,10 @@ def _record_task_failure(
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
 
-        if failures >= effective_limit:
-            # Trip the breaker.
+        if permanent or failures >= effective_limit:
+            # Trip the breaker. ``permanent`` trips on the first failure —
+            # a permanent cause (e.g. a forced skill that's missing/disabled)
+            # cannot succeed on retry, so there's no point counting to the limit.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
@@ -5371,12 +5374,25 @@ def _record_task_failure(
                 "limit_source": limit_source,
                 "error": error[:500],
                 "trigger_outcome": outcome,
+                "permanent": permanent,
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
-            _append_event(
-                conn, task_id, "gave_up", payload, run_id=run_id,
-            )
+            if permanent:
+                # A permanent failure (e.g. a forced skill that's missing or
+                # disabled) can never succeed on retry. Emit a *sticky*
+                # ``blocked`` event — the same kind an explicit ``kanban_block``
+                # writes — so ``recompute_ready`` / ``_has_sticky_block`` leave
+                # it parked for a human instead of auto-reviving it into an
+                # infinite respawn loop. A ``reason`` makes the block legible to
+                # the gateway notifier. Transient failures still emit ``gave_up``
+                # and keep upstream's auto-recovery semantics untouched.
+                payload.setdefault("reason", error[:160])
+                _append_event(conn, task_id, "blocked", payload, run_id=run_id)
+            else:
+                _append_event(
+                    conn, task_id, "gave_up", payload, run_id=run_id,
+                )
             blocked = True
         else:
             # Below threshold.
@@ -5429,6 +5445,7 @@ def _record_spawn_failure(
     *,
     failure_limit: int = None,
     event_payload_extra: Optional[dict] = None,
+    permanent: bool = False,
 ) -> bool:
     return _record_task_failure(
         conn, task_id, error,
@@ -5437,6 +5454,7 @@ def _record_spawn_failure(
         release_claim=True,
         end_run=True,
         event_payload_extra=event_payload_extra,
+        permanent=permanent,
     )
 
 
@@ -5960,6 +5978,9 @@ def dispatch_once(
                 preflight.get("error") or "forced skill preflight failed",
                 failure_limit=1,
                 event_payload_extra=preflight,
+                # A missing/disabled forced skill can never resolve on retry —
+                # mark it permanent so it sticky-blocks instead of looping.
+                permanent=True,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)

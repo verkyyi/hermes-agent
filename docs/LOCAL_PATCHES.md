@@ -26,7 +26,7 @@ test coverage lives — so the divergence stays legible across upstream merges.
 | 3 | Full handoff summary in the completed event (no first-line/400-char cap) | `39a5bf9ff`, `3592c3510` | `tests/hermes_cli/test_kanban_core_functionality.py` |
 | 4 | Fork-local notify-sub schema guards (idempotent ALTERs for the 5 origin/mode columns) | `3592c3510`, `7ee088258` | `tests/tools/test_kanban_tools.py` |
 | 5 | Kanban lifecycle recovery hardening (heartbeat/claim/stale-run/audit) | `380eec386` | `tests/hermes_cli/test_kanban_db.py` (+ `tests/local/`) |
-| 6 | Orchestrator 3-layer routing (front-desk → orchestrator → workers) | `95757a2c3` | `tests/orchestrator_benchmark/test_frontdesk_routing.py` (4) |
+| 6 | Orchestrator 3-layer routing (front-desk → orchestrator → workers) | `95757a2c3`; routing guard moved to plugin `kanban-orchestrator-routing` | `tests/orchestrator_benchmark/test_frontdesk_routing.py` (10) |
 | 7 | Orchestrator hardening benchmark (executable TDD spec) | `13c1fc21e` | `tests/orchestrator_benchmark/` + `evals/orchestrator_routing/` (GREEN guards + `xfail(strict)` TDD targets) |
 | 8 | Replay wall-clock timestamp prefix on user messages | `39a5bf9ff` | `tests/gateway/test_user_timestamp_prefix.py` (5) |
 | 9 | AgentFeeds stable manifest in the cache-stable prompt region | `2ea24d4bb`, `62aa2c45c` | `tests/local/run_agent/test_agentfeeds.py` |
@@ -171,6 +171,27 @@ orchestrator_routing/`: linking/ownership, block grouped-notify, transient
 auto-recovery, garbage auto-archive, e2e lifecycle, LLM routing eval. GREEN tests
 guard current behavior; **`xfail(strict)` targets** flip to failures once their
 `kanban_db` contract functions are implemented (pending feature work).
+
+> **Routing guard → plugin (`plugins/kanban-orchestrator-routing/`).** The
+> reject-only `create` guard was lifted out of an inline edit in the hot upstream
+> file `tools/kanban_tools.py::_handle_create` into an opt-in standalone plugin
+> that registers a **`pre_tool_call`** hook. The hook returns
+> `{"action": "block", "message": ...}` for a front-desk `kanban_create` aimed at
+> a non-orchestrator lane; the executor wraps it as `{"error": <message>}` — the
+> same shape the old inline `tool_error` produced. Scope/exemptions are unchanged
+> (it reads the same `HERMES_PROFILE` / `HERMES_KANBAN_TASK` env vars the inline
+> code read). `_handle_create` is now routing-agnostic; the only remaining core
+> touch is upstream's own `pre_tool_call` dispatch in `agent/tool_executor.py`.
+> **Tradeoff — opt-in:** standalone plugins load only when listed in
+> `plugins.enabled`, so this safety invariant is now config-gated rather than
+> always-on. The deploy config must enable `kanban-orchestrator-routing` for the
+> guard to be active; `KANBAN_ORCHESTRATOR_ROUTING_DISABLE=1` keeps it installed
+> but inert. Tests (`test_frontdesk_routing.py`) cover the hook scope, the
+> guardrails (absent assignee not masked, non-create tools ignored, disable flag),
+> the now-routing-agnostic handler, and the real plugin-manager wiring **and**
+> opt-in gating end-to-end. Verified: 10 passed; the full
+> `tests/tools/test_kanban_tools.py` + `tests/orchestrator_benchmark/` suite
+> stays green (179 passed / 1 skipped / 20 xfailed).
 
 ---
 

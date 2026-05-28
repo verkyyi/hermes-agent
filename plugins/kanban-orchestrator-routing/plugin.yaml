@@ -1,0 +1,6 @@
+name: kanban-orchestrator-routing
+version: "0.1.0"
+description: "Front-desk routing invariant as a pre_tool_call hook: a kanban_create issued from the DEFAULT front-desk profile (HERMES_PROFILE unset/\"default\", not dispatcher-spawned) must use assignee='orchestrator'. Reject-only (no coercion) so the model re-issues. Exempt: the orchestrator profile in both modes and every worker. Replaces a fork-local inline edit in tools/kanban_tools.py::_handle_create — see docs/LOCAL_PATCHES.md #6. OPT-IN: standalone plugins load only when listed in plugins.enabled."
+author: "NousResearch (Hermes fork — Verky)"
+hooks:
+  - pre_tool_call

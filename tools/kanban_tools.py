@@ -1,8 +1,10 @@
 """Kanban tools — structured tool-call surface for worker + orchestrator agents.
 
-These tools are only registered into the model's schema when the agent is
-running under the dispatcher (env var ``HERMES_KANBAN_TASK`` set). A
-normal ``hermes chat`` session sees **zero** kanban tools in its schema.
+These tools are registered into the model's schema when the agent is
+running under the dispatcher (env var ``HERMES_KANBAN_TASK`` set) or when
+the active profile explicitly enables the ``kanban`` toolset for
+orchestrator work. A normal ``hermes chat`` session still sees **zero**
+kanban tools in its schema unless configured.
 
 Why tools instead of just shelling out to ``hermes kanban``?
 
@@ -20,8 +22,9 @@ Why tools instead of just shelling out to ``hermes kanban``?
 
 Humans continue to use the CLI (``hermes kanban …``), the dashboard
 (``hermes dashboard``), and the slash command (``/kanban …``) — all
-three bypass the agent entirely. The tools are ONLY for the worker
-agent's handoff back to the kernel.
+three bypass the agent entirely. The tools are for dispatcher-spawned
+worker handoffs and for configured orchestrator profiles that route work
+through the board.
 """
 from __future__ import annotations
 
@@ -118,6 +121,20 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _stamp_worker_session_metadata(
+    task_id: str, metadata: Optional[dict]
+) -> Optional[dict]:
+    """Add trusted worker session id metadata for this worker's own task."""
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return metadata
+    session_id = os.environ.get("HERMES_SESSION_ID")
+    if not session_id:
+        return metadata
+    stamped = dict(metadata or {})
+    stamped["worker_session_id"] = session_id
+    return stamped
+
+
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
@@ -150,11 +167,19 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
-def _connect():
+def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
-    contexts (e.g. test rigs that import every tool module)."""
+    contexts (e.g. test rigs that import every tool module).
+
+    When ``board`` is provided it's forwarded to :func:`kb.connect`, which
+    routes the connection to that board's sqlite file. ``None`` (the
+    default) preserves the legacy resolution chain
+    (``HERMES_KANBAN_DB`` → ``HERMES_KANBAN_BOARD`` env → current symlink
+    → ``default``). Per-tool ``board`` lets a Telegram-side agent override
+    the env-pinned active board without restarting Hermes.
+    """
     from hermes_cli import kanban_db as kb
-    return kb, kb.connect()
+    return kb, kb.connect(board=board)
 
 
 def _ok(**fields: Any) -> str:
@@ -347,6 +372,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "started_at": task.started_at,
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
+        "model_override": task.model_override,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -366,8 +392,9 @@ def _handle_show(args: dict, **kw) -> str:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
+    board = args.get("board")
     try:
-        kb, conn = _connect()
+        kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
             if task is None:
@@ -390,6 +417,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "completed_at": t.completed_at,
                     "result": t.result,
                     "current_run_id": t.current_run_id,
+                    "model_override": t.model_override,
                 }
 
             def _run_dict(r):
@@ -424,6 +452,9 @@ def _handle_show(args: dict, **kw) -> str:
             })
         finally:
             conn.close()
+    except ValueError as e:
+        # Invalid board slug surfaces as ValueError from _normalize_board_slug.
+        return tool_error(f"kanban_show: {e}")
     except Exception as e:
         logger.exception("kanban_show failed")
         return tool_error(f"kanban_show: {e}")
@@ -451,8 +482,9 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error("limit must be >= 1")
     if limit > KANBAN_LIST_MAX_LIMIT:
         return tool_error(f"limit must be <= {KANBAN_LIST_MAX_LIMIT}")
+    board = args.get("board")
     try:
-        kb, conn = _connect()
+        kb, conn = _connect(board=board)
         try:
             # Match CLI list: dependencies that cleared since the last
             # dispatcher tick should be visible to orchestrators immediately.
@@ -503,6 +535,7 @@ def _handle_complete(args: dict, **kw) -> str:
     metadata = args.get("metadata")
     result = args.get("result")
     created_cards = args.get("created_cards")
+    artifacts = args.get("artifacts")
     if created_cards is not None:
         if isinstance(created_cards, str):
             # Accept a single id as a string for convenience.
@@ -516,6 +549,45 @@ def _handle_complete(args: dict, **kw) -> str:
         created_cards = [
             str(c).strip() for c in created_cards if str(c).strip()
         ]
+    if artifacts is not None:
+        if isinstance(artifacts, str):
+            # Accept a single path as a string for convenience.
+            artifacts = [artifacts]
+        if not isinstance(artifacts, (list, tuple)):
+            return tool_error(
+                f"artifacts must be a list of file paths, got "
+                f"{type(artifacts).__name__}"
+            )
+        artifacts = [
+            str(p).strip() for p in artifacts if str(p).strip()
+        ]
+        # Carry the artifact list inside metadata so it rides the
+        # existing completed-event payload without a schema change at
+        # the DB layer.  The gateway notifier reads payload['artifacts']
+        # off the completion event and uploads each path as a native
+        # attachment.
+        if artifacts:
+            if metadata is None:
+                metadata = {}
+            elif not isinstance(metadata, dict):
+                return tool_error(
+                    f"metadata must be an object/dict, got "
+                    f"{type(metadata).__name__}"
+                )
+            # Don't overwrite an existing metadata.artifacts the worker
+            # passed manually — merge instead.
+            existing = metadata.get("artifacts")
+            if isinstance(existing, (list, tuple)):
+                merged: list[str] = []
+                seen: set[str] = set()
+                for item in list(existing) + artifacts:
+                    s = str(item).strip()
+                    if s and s not in seen:
+                        seen.add(s)
+                        merged.append(s)
+                metadata["artifacts"] = merged
+            else:
+                metadata["artifacts"] = artifacts
     if not (summary or result):
         return tool_error(
             "provide at least one of: summary (preferred), result"
@@ -524,8 +596,10 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    metadata = _stamp_worker_session_metadata(tid, metadata)
+    board = args.get("board")
     try:
-        kb, conn = _connect()
+        kb, conn = _connect(board=board)
         try:
             try:
                 ok = kb.complete_task(
@@ -574,6 +648,8 @@ def _handle_complete(args: dict, **kw) -> str:
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_complete: {e}")
     except Exception as e:
         logger.exception("kanban_complete failed")
         return tool_error(f"kanban_complete: {e}")
@@ -592,8 +668,9 @@ def _handle_block(args: dict, **kw) -> str:
     reason = args.get("reason")
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
+    board = args.get("board")
     try:
-        kb, conn = _connect()
+        kb, conn = _connect(board=board)
         try:
             ok = kb.block_task(
                 conn, tid,
@@ -609,6 +686,8 @@ def _handle_block(args: dict, **kw) -> str:
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
             conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_block: {e}")
     except Exception as e:
         logger.exception("kanban_block failed")
         return tool_error(f"kanban_block: {e}")
@@ -633,8 +712,9 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     if ownership_err:
         return ownership_err
     note = args.get("note")
+    board = args.get("board")
     try:
-        kb, conn = _connect()
+        kb, conn = _connect(board=board)
         try:
             # Extend the claim TTL first. The dispatcher pins
             # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
@@ -657,6 +737,8 @@ def _handle_heartbeat(args: dict, **kw) -> str:
             return _ok(task_id=tid)
         finally:
             conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_heartbeat: {e}")
     except Exception as e:
         logger.exception("kanban_heartbeat failed")
         return tool_error(f"kanban_heartbeat: {e}")
@@ -683,13 +765,16 @@ def _handle_comment(args: dict, **kw) -> str:
     # Cross-task commenting itself remains unrestricted (see #19713) —
     # comments are the deliberate handoff channel between tasks.
     author = os.environ.get("HERMES_PROFILE") or "worker"
+    board = args.get("board")
     try:
-        kb, conn = _connect()
+        kb, conn = _connect(board=board)
         try:
             cid = kb.add_comment(conn, tid, author=author, body=str(body))
             return _ok(task_id=tid, comment_id=cid)
         finally:
             conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_comment: {e}")
     except Exception as e:
         logger.exception("kanban_comment failed")
         return tool_error(f"kanban_comment: {e}")
@@ -728,6 +813,10 @@ def _handle_create(args: dict, **kw) -> str:
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
+    # Stamp the originating session id when the agent loop runs under
+    # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
+    # CLI / dashboard paths and on legacy hosts that don't set the env.
+    session_id = args.get("session_id") or os.environ.get("HERMES_SESSION_ID")
     priority = args.get("priority")
     workspace_kind = args.get("workspace_kind") or "scratch"
     workspace_path = args.get("workspace_path")
@@ -736,6 +825,7 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
+    initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -750,8 +840,9 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
+    board = args.get("board")
     try:
-        kb, conn = _connect()
+        kb, conn = _connect(board=board)
         try:
             new_tid = kb.create_task(
                 conn,
@@ -770,7 +861,9 @@ def _handle_create(args: dict, **kw) -> str:
                     if max_runtime_seconds is not None else None
                 ),
                 skills=skills,
+                initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
             subscription = _auto_subscribe_origin_for_created_task(
@@ -848,8 +941,9 @@ def _handle_unblock(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(str(tid))
     if ownership_err:
         return ownership_err
+    board = args.get("board")
     try:
-        kb, conn = _connect()
+        kb, conn = _connect(board=board)
         try:
             ok = kb.unblock_task(conn, str(tid))
             if not ok:
@@ -857,6 +951,8 @@ def _handle_unblock(args: dict, **kw) -> str:
             return _ok(task_id=str(tid), status="ready")
         finally:
             conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_unblock: {e}")
     except Exception as e:
         logger.exception("kanban_unblock failed")
         return tool_error(f"kanban_unblock: {e}")
@@ -868,8 +964,9 @@ def _handle_link(args: dict, **kw) -> str:
     child_id = args.get("child_id")
     if not parent_id or not child_id:
         return tool_error("both parent_id and child_id are required")
+    board = args.get("board")
     try:
-        kb, conn = _connect()
+        kb, conn = _connect(board=board)
         try:
             kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
             return _ok(parent_id=parent_id, child_id=child_id)
@@ -892,6 +989,24 @@ _DESC_TASK_ID_DEFAULT = (
     "(the task the dispatcher spawned you to work on)."
 )
 
+_DESC_BOARD = (
+    "Kanban board slug to target. When omitted, the call resolves the "
+    "active board the usual way: HERMES_KANBAN_DB env → "
+    "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
+    "home → 'default'. Pass an explicit slug only when the caller (e.g. "
+    "a Telegram routing layer) needs to override the env-pinned active "
+    "board for this one call."
+)
+
+
+def _board_schema_prop() -> dict[str, str]:
+    """Schema fragment for the optional ``board`` parameter.
+
+    Centralised so a future tweak to the description / validation hint
+    only has to land in one place.
+    """
+    return {"type": "string", "description": _DESC_BOARD}
+
 KANBAN_SHOW_SCHEMA = {
     "name": "kanban_show",
     "description": (
@@ -909,6 +1024,7 @@ KANBAN_SHOW_SCHEMA = {
                 "type": "string",
                 "description": _DESC_TASK_ID_DEFAULT,
             },
+            "board": _board_schema_prop(),
         },
         "required": [],
     },
@@ -953,6 +1069,7 @@ KANBAN_LIST_SCHEMA = {
                 "type": "integer",
                 "description": "Optional maximum rows to return (default 50, max 200).",
             },
+            "board": _board_schema_prop(),
         },
         "required": [],
     },
@@ -970,7 +1087,12 @@ KANBAN_COMPLETE_SCHEMA = {
         "tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
         "references are caught before they leak into downstream "
-        "automation."
+        "automation. If you produced deliverable files (charts, PDFs, "
+        "spreadsheets, generated images), list their absolute paths "
+        "in ``artifacts`` — the gateway notifier will upload them as "
+        "native attachments to the human who subscribed to the task, "
+        "so the deliverable lands in their chat alongside the summary "
+        "instead of being a path they have to fetch by hand."
     ),
     "parameters": {
         "type": "object",
@@ -1021,6 +1143,26 @@ KANBAN_COMPLETE_SCHEMA = {
                     "did not create any cards."
                 ),
             },
+            "artifacts": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional list of absolute paths to deliverable "
+                    "files you produced during this run — generated "
+                    "charts, PDFs, spreadsheets, images, archives. "
+                    "Examples: [\"/tmp/q3-revenue.png\", "
+                    "\"/tmp/report.pdf\"]. The gateway notifier "
+                    "uploads each path as a native attachment to the "
+                    "subscribed chat (images embed inline, everything "
+                    "else uploads as a file) so the deliverable "
+                    "lands with the completion notification. Skip "
+                    "intermediate scratch files and references that "
+                    "are not the deliverable. The path must exist "
+                    "on disk when the notifier runs; missing files "
+                    "are silently skipped."
+                ),
+            },
+            "board": _board_schema_prop(),
         },
         "required": [],
     },
@@ -1050,6 +1192,7 @@ KANBAN_BLOCK_SCHEMA = {
                     "the board and can ask follow-ups via comments."
                 ),
             },
+            "board": _board_schema_prop(),
         },
         "required": ["reason"],
     },
@@ -1077,6 +1220,7 @@ KANBAN_HEARTBEAT_SCHEMA = {
                     "Shown in the event log."
                 ),
             },
+            "board": _board_schema_prop(),
         },
         "required": [],
     },
@@ -1104,6 +1248,7 @@ KANBAN_COMMENT_SCHEMA = {
                 "type": "string",
                 "description": "Markdown-supported comment body.",
             },
+            "board": _board_schema_prop(),
         },
         "required": ["task_id", "body"],
     },
@@ -1208,6 +1353,16 @@ KANBAN_CREATE_SCHEMA = {
                     "task with outcome='timed_out'."
                 ),
             },
+            "initial_status": {
+                "type": "string",
+                "enum": ["running", "blocked"],
+                "description": (
+                    "Initial card status. Use 'blocked' for tasks that "
+                    "require immediate human ops (R3 gate) to skip the "
+                    "brief running-to-blocked transition. Defaults to "
+                    "'running', which preserves the usual dispatch path."
+                ),
+            },
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1234,6 +1389,7 @@ KANBAN_CREATE_SCHEMA = {
                     "tool-created tasks and direct elsewhere."
                 ),
             },
+            "board": _board_schema_prop(),
         },
         "required": ["title", "assignee"],
     },
@@ -1253,6 +1409,7 @@ KANBAN_UNBLOCK_SCHEMA = {
                 "type": "string",
                 "description": "Blocked task id to return to ready.",
             },
+            "board": _board_schema_prop(),
         },
         "required": ["task_id"],
     },
@@ -1270,6 +1427,7 @@ KANBAN_LINK_SCHEMA = {
         "properties": {
             "parent_id": {"type": "string", "description": "Parent task id."},
             "child_id":  {"type": "string", "description": "Child task id."},
+            "board": _board_schema_prop(),
         },
         "required": ["parent_id", "child_id"],
     },

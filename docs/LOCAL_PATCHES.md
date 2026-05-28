@@ -24,7 +24,7 @@ test coverage lives — so the divergence stays legible across upstream merges.
 | 1 | Kanban origin-return + notification modes (`direct`/`synthesize`/`silent`) | `be4900d9d`, `0a75a7315` | `tests/gateway/test_kanban_notifier.py`, `tests/tools/test_kanban_tools.py` (+ `tests/local/`) |
 | 2 | Kanban completion **synthesis**, extracted into `KanbanSynthesisMixin` | `39a5bf9ff` | `tests/gateway/test_kanban_notifier.py` (+ `tests/local/gateway/`) |
 | 3 | Full handoff summary in the completed event (no first-line/400-char cap) | `39a5bf9ff`, `3592c3510` | `tests/hermes_cli/test_kanban_core_functionality.py` |
-| 4 | Post-v0.14.0 migration-guard cleanup | `3592c3510` | `tests/tools/test_kanban_tools.py` |
+| 4 | Fork-local notify-sub schema guards (idempotent ALTERs for the 5 origin/mode columns) | `3592c3510`, `7ee088258` | `tests/tools/test_kanban_tools.py` |
 | 5 | Kanban lifecycle recovery hardening (heartbeat/claim/stale-run/audit) | `380eec386` | `tests/hermes_cli/test_kanban_db.py` (+ `tests/local/`) |
 | 6 | Orchestrator 3-layer routing (front-desk → orchestrator → workers) | `95757a2c3` | `tests/orchestrator_benchmark/test_frontdesk_routing.py` (4) |
 | 7 | Orchestrator hardening benchmark (executable TDD spec) | `13c1fc21e` | `tests/orchestrator_benchmark/` + `evals/orchestrator_routing/` (GREEN guards + `xfail(strict)` TDD targets) |
@@ -63,6 +63,28 @@ Key files: `gateway/run.py`, `hermes_cli/kanban_db.py`, `tools/kanban_tools.py`,
 `model_tools.py`, `toolsets.py`. Post-merge, the `request_id` plumbing lives in
 `agent/tool_executor.py` and `agent/agent_runtime_helpers.py` (upstream's refactor).
 
+> **Planned refactor — extract the notifier into a mixin (not a plugin).**
+> Most of this patch is additive (new `kanban_notify_subs` table + functions in
+> `kanban_db.py`, new tool surface in `kanban_tools.py`) and rarely conflicts on
+> merge. The real merge pain is the notifier in the hot upstream file
+> `gateway/run.py` (still ~19.4k lines and growing after the 2026-05-27 catchup).
+> `_kanban_notifier_watcher()` is confirmed still defined there post-merge. Lift
+> it and its helpers into `gateway/kanban_notifier.py::KanbanNotifierMixin` —
+> extending the #2 mixin pattern (`KanbanSynthesisMixin` already lives in
+> `gateway/kanban_synthesis.py`) — leaving only
+> `GatewayRunner(KanbanNotifierMixin, KanbanSynthesisMixin, …)` plus the watcher
+> `create_task(...)` in `run.py`. The watcher keeps its privileged `self.*`
+> access (platform adapters, session mirroring, `_conversation_lock_for_source`,
+> origin-profile LLM). Behavior-preserving.
+> **A plugin/hook rewrite was considered and rejected:** the feature is a
+> cross-process background reactor (completion fires in a separate worker process;
+> the gateway polls DB state on a ~5s tick) that needs gateway internals the
+> plugin contract (`hermes_cli/plugins.py`) and gateway hooks (`gateway/hooks.py`)
+> deliberately don't expose. A plugin would first require new core extension
+> points (background-task registration, a `kanban_event` hook, adapter/mirror
+> access) — that's *more* local divergence, not less, unless those points are
+> upstreamed.
+
 ### 2. Completion synthesis → `KanbanSynthesisMixin` (`39a5bf9ff`)
 The `synthesize`-mode logic (origin-profile LLM rewrite, sanitized timeout
 fallback, bounded artifact-excerpt loading) was extracted out of `GatewayRunner`
@@ -76,11 +98,26 @@ line / 400 chars, and the gateway notifier no longer truncates the rendered
 handoff. The Kanban DB is the single source of truth; downstream readers
 (Telegram, synthesis, dashboard WS) must see the complete handoff.
 
-### 4. Migration-guard cleanup (`3592c3510`)
-`_migrate_add_optional_columns` drops the ALTER-guard block for
-`notification_mode` / `origin_session_id` / `origin_profile` / `origin_context` /
-`request_id` — these are in the base `CREATE TABLE` schema as of upstream
-v0.14.0. `notifier_profile`'s guard is kept for legacy pre-upstream DBs.
+### 4. Fork-local notify-sub schema guards (`3592c3510`, corrected in `7ee088258`)
+`_migrate_add_optional_columns` keeps idempotent `ALTER TABLE … ADD COLUMN`
+guards for `notification_mode` / `origin_session_id` / `origin_profile` /
+`origin_context` / `request_id` (plus the longstanding `notifier_profile`).
+
+> **Correction.** `3592c3510` originally *removed* these five guards on the
+> stated rationale that the columns were "in the base `CREATE TABLE` schema as
+> of upstream v0.14.0." **That premise is false.** These columns are
+> **fork-local**: they exist in the upstream tree only on the **unmerged** PR
+> branch `upstream/pr-21523` (`be4900d9d` is *our* commit / the PR head, not an
+> upstream merge). Even after the 2026-05-27 catchup, upstream `main`
+> (`origin/main` @ `2d5dcfabc`) ships `kanban_notify_subs` with **only**
+> `notifier_profile` — verified zero of the five columns present. Because
+> they're part of *our* base `CREATE TABLE` but not upstream's, and
+> `CREATE TABLE IF NOT EXISTS` is a no-op against a table first created by an
+> upstream-schema (or older-fork) checkout, the ALTER guards are the **only**
+> mechanism that backfills the columns on such a DB. They were restored in
+> `7ee088258`. **Preserve these across upstream merges** (upstream won't supply
+> them); they can be retired only once PR #21523 actually lands upstream — add
+> to the #18 per-merge re-verification list.
 
 ### 5. Lifecycle recovery hardening (`380eec386`)
 Hardens kanban run lifecycle: heartbeat extends only the owner's current run,

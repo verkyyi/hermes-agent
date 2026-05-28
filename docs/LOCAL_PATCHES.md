@@ -36,6 +36,7 @@ merge. Details live in the code and the listed commits, not here.
 - **Break-glass escape hatch** — operator recovery for stuck state; **keep the `break-glass-cli` plugin enabled**. (`0a75a7315`)
 - **Google Workspace OAuth hardening** — scope filtering, JSON auth-url payloads, fresh URL on failure. (`0a75a7315`)
 - **Profile-memory dashboard plugin** — UI for editing profile memory. (`ee0334194`)
+- **Local dashboard-auth provider** — bundled `local` DashboardAuthProvider lets the dashboard bind to a non-loopback host (LAN) with auth but without the Nous Portal `agent:{instance_id}` client_id the `nous` provider needs. Activates only when `dashboard.local_auth.passcode` / `HERMES_DASHBOARD_LOCAL_PASSCODE` is set (fail-closed, like `nous`); sessions are stateless HMAC tokens keyed on the passcode (rotation invalidates them). Adds an **additive** pre-auth `GET/POST /auth/password` form (providers opt in via `password_login=True`) + one middleware allowlist entry + a `render_password_html()`; no existing auth logic modified. Local test: `tests/local/hermes_cli/test_dashboard_auth_local_provider.py`. (`1e547e0ce`)
 
 ## Security & maintenance
 - **CVE security re-pins** — `aiohttp==3.13.4`, `anthropic==0.87.0`, `cryptography==46.0.7`; **re-check every merge**. (`84ceb225c`)

@@ -63,19 +63,24 @@ Key files: `gateway/run.py`, `hermes_cli/kanban_db.py`, `tools/kanban_tools.py`,
 `model_tools.py`, `toolsets.py`. Post-merge, the `request_id` plumbing lives in
 `agent/tool_executor.py` and `agent/agent_runtime_helpers.py` (upstream's refactor).
 
-> **Planned refactor — extract the notifier into a mixin (not a plugin).**
+> **Refactor — done (`4c3843555`).**
 > Most of this patch is additive (new `kanban_notify_subs` table + functions in
 > `kanban_db.py`, new tool surface in `kanban_tools.py`) and rarely conflicts on
-> merge. The real merge pain is the notifier in the hot upstream file
-> `gateway/run.py` (still ~19.4k lines and growing after the 2026-05-27 catchup).
-> `_kanban_notifier_watcher()` is confirmed still defined there post-merge. Lift
-> it and its helpers into `gateway/kanban_notifier.py::KanbanNotifierMixin` —
-> extending the #2 mixin pattern (`KanbanSynthesisMixin` already lives in
-> `gateway/kanban_synthesis.py`) — leaving only
-> `GatewayRunner(KanbanNotifierMixin, KanbanSynthesisMixin, …)` plus the watcher
-> `create_task(...)` in `run.py`. The watcher keeps its privileged `self.*`
-> access (platform adapters, session mirroring, `_conversation_lock_for_source`,
-> origin-profile LLM). Behavior-preserving.
+> merge. The real merge pain was the notifier in the hot upstream file
+> `gateway/run.py`. The terminal-event notifier — `_kanban_notifier_watcher()`
+> plus `_kanban_notify_in_gateway_enabled`, `_active_profile_name`,
+> `_kanban_advance`, `_kanban_unsub`, `_kanban_rewind`,
+> `_deliver_kanban_artifacts` — was lifted into
+> `gateway/kanban_notifier.py::KanbanNotifierMixin`, mixed in via
+> `class GatewayRunner(KanbanSynthesisMixin, KanbanNotifierMixin)` (extending the
+> #2 mixin pattern). Methods moved byte-for-byte; the watcher `create_task(...)`
+> and the module-level progress/notify constants + helpers
+> (`_KANBAN_NOTIFY_KINDS`, `_public_progress_interval_from_env`,
+> `_kanban_heartbeat_progress_message`) stay in `run.py` and are imported lazily
+> in the watcher to avoid a circular import. The watcher keeps its privileged
+> `self.*` access (adapters, `_send_kanban_notification`, per-sub state).
+> `run.py` 19,392 → 18,796 lines (−610). Behavior-preserving: notifier+kanban
+> suite 484 passed / 1 skipped, ruff clean, ty neutral for `run.py`.
 > **A plugin/hook rewrite was considered and rejected:** the feature is a
 > cross-process background reactor (completion fires in a separate worker process;
 > the gateway polls DB state on a ~5s tick) that needs gateway internals the

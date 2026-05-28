@@ -5,8 +5,9 @@ This document inventories them — what each patch is, why it exists, and where 
 test coverage lives — so the divergence stays legible across upstream merges.
 
 - **Running branch:** `verky/deploy`
-- **Upstream baseline:** `v2026.5.16` (v0.14.0, commit `a91a57fa5`)
+- **Upstream baseline:** caught up to `upstream/main` @ `2d5dcfabc` via merge `4a9607afd` (2026-05-27). Originally forked at `v2026.5.16` / `a91a57fa5`.
 - **Upstream mirror:** local `main` tracks `upstream/main`
+- **Last upstream sync:** 2026-05-27 — 1,239 commits. Upstream refactored `run_agent.py` and parts of `gateway/run.py` into new `agent/*` modules, so several patches were re-homed (noted per-patch below). Test infra moved to `pytest-timeout` (xdist dropped).
 
 > **Maintenance workflow.** Keep `main` a pristine upstream mirror — fast-forward
 > only (`git fetch upstream && git branch -f main upstream/main`), never merge
@@ -59,7 +60,8 @@ platform send the subscription **retries** instead of silently dropping.
 Parentless worker-created recovery/root tasks inherit the original subscription;
 ordinary children stay quiet by default.
 Key files: `gateway/run.py`, `hermes_cli/kanban_db.py`, `tools/kanban_tools.py`,
-`model_tools.py`, `toolsets.py`.
+`model_tools.py`, `toolsets.py`. Post-merge, the `request_id` plumbing lives in
+`agent/tool_executor.py` and `agent/agent_runtime_helpers.py` (upstream's refactor).
 
 ### 2. Completion synthesis → `KanbanSynthesisMixin` (`39a5bf9ff`)
 The `synthesize`-mode logic (origin-profile LLM rewrite, sanitized timeout
@@ -118,6 +120,7 @@ guard current behavior; **`xfail(strict)` targets** flip to failures once their
 (America/Los_Angeles) to replayed **user** messages so the model perceives
 send-time and inter-turn gaps. Applied at replay only (not persisted → no
 double-prefix); plain-string user content only, multimodal parts untouched.
+**Home (post-merge):** applied in `gateway/run.py::_build_gateway_agent_history`.
 
 ### 11. UX slimming + explicit-skill policy (`0a75a7315`)
 Hides internal Kanban plumbing from normal Telegram/Weixin replies by default
@@ -141,6 +144,9 @@ fast feedback on long-running work. See also the responsiveness benchmark (#17).
 The AgentFeeds system manifest (a stable, per-session stream inventory that
 excludes volatile freshness/health/content) is appended to `stable_parts` so it
 lands in the cache-stable prompt prefix rather than the volatile tail.
+**Homes (post-merge):** helper functions stay in `run_agent.py`; the wiring is in
+`agent/system_prompt.py::build_system_prompt_parts` (lazy `import run_agent`,
+monkeypatch-safe); config init in `agent/agent_init.py`.
 NOTE: the pre-patch code appended to a non-existent `prompt_parts` local — a
 latent `NameError` when the manifest was enabled — so this both fixes the crash
 and improves prompt caching.

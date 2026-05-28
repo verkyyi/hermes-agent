@@ -53,7 +53,7 @@ def seed_tasks(conn, kb, n, assignee="bench-worker", with_parents=False):
     return ids
 
 
-def main():
+def main(out_path=None):
     home = tempfile.mkdtemp(prefix="hermes_bench_")
     os.environ["HERMES_HOME"] = home
     os.environ["HOME"] = home
@@ -210,11 +210,16 @@ def main():
     for r in results:
         print(f"{r['label']:<50} {r['min_ms']:>7.1f}ms {r['median_ms']:>7.1f}ms {r['max_ms']:>7.1f}ms")
 
-    # Save for future diffing.
-    out_path = "/tmp/kanban_bench_results.json"
+    # Save for future diffing. Honor an explicit out_path (or KANBAN_BENCH_OUT
+    # env) so callers like HermesBench can collect results from an isolated
+    # subprocess; default keeps the historical /tmp location.
+    out_path = out_path or os.environ.get(
+        "KANBAN_BENCH_OUT", "/tmp/kanban_bench_results.json"
+    )
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to {out_path}")
+    return results
 
 
 if __name__ == "__main__":

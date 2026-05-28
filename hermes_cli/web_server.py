@@ -4822,6 +4822,84 @@ _mount_plugin_api_routes()
 from hermes_cli.dashboard_auth.routes import router as _dashboard_auth_router  # noqa: E402
 app.include_router(_dashboard_auth_router)
 
+
+# ---------------------------------------------------------------------------
+# HermesBench trend view — a self-contained page (no SPA build needed) plus a
+# JSON endpoint over the consolidated-benchmark trend store. Registered before
+# the SPA catch-all so /{full_path:path} doesn't swallow them.
+# ---------------------------------------------------------------------------
+@app.get("/api/hermesbench/trend")
+async def hermesbench_trend(limit: int = 30):
+    try:
+        from evals.hermesbench import store
+        runs = store.recent_runs(limit=limit)
+    except Exception as exc:  # store missing / unreadable — empty, not 500
+        return JSONResponse({"runs": [], "error": str(exc)})
+    return JSONResponse({"runs": runs})
+
+
+_HERMESBENCH_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<title>HermesBench trend</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+ body{font:14px -apple-system,system-ui,sans-serif;margin:0;background:#0d1117;color:#e6edf3}
+ .wrap{max-width:1000px;margin:0 auto;padding:24px}
+ h1{font-size:20px;margin:0 0 4px} .sub{color:#8b949e;margin:0 0 20px}
+ .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:20px}
+ svg{width:100%;height:200px} .empty{color:#8b949e;padding:40px;text-align:center}
+ table{width:100%;border-collapse:collapse;font-size:13px}
+ th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #21262d}
+ th{color:#8b949e;font-weight:600} .pass{color:#3fb950} .fail{color:#f85149} .skip{color:#8b949e}
+ .score{font-variant-numeric:tabular-nums}
+</style></head><body><div class="wrap">
+<h1>HermesBench</h1><p class="sub">Consolidated daily benchmark — overall score over time (local profile).</p>
+<div class="card"><svg id="chart" viewBox="0 0 800 200" preserveAspectRatio="none"></svg></div>
+<div class="card"><div id="table"></div></div>
+</div><script>
+const TOKEN="__TOKEN__", HEADER="__HEADER__";
+async function load(){
+ const r=await fetch("__BASE__/api/hermesbench/trend?limit=30",{headers:{[HEADER]:TOKEN},credentials:"include"});
+ const d=await r.json(); const runs=(d.runs||[]).slice().reverse(); render(runs);
+}
+function render(runs){
+ const chart=document.getElementById("chart"), tbl=document.getElementById("table");
+ if(!runs.length){chart.innerHTML='<text x="400" y="100" fill="#8b949e" text-anchor="middle">no runs yet — run: python -m evals.hermesbench.run</text>';tbl.innerHTML='<p class="empty">No runs recorded yet.</p>';return;}
+ const pts=runs.map((r,i)=>({i,s:r.overall_score})).filter(p=>p.s!=null);
+ const W=800,H=200,pad=24, n=Math.max(1,pts.length-1);
+ const x=i=>pad+(W-2*pad)*(i/n), y=s=>H-pad-(H-2*pad)*(s/100);
+ let path=pts.map((p,k)=>(k?"L":"M")+x(p.i).toFixed(1)+" "+y(p.s).toFixed(1)).join(" ");
+ let dots=pts.map(p=>'<circle cx="'+x(p.i).toFixed(1)+'" cy="'+y(p.s).toFixed(1)+'" r="3" fill="#58a6ff"/>').join("");
+ let grid=[0,25,50,75,100].map(v=>'<line x1="'+pad+'" y1="'+y(v)+'" x2="'+(W-pad)+'" y2="'+y(v)+'" stroke="#21262d"/><text x="2" y="'+(y(v)+4)+'" fill="#8b949e" font-size="10">'+v+'</text>').join("");
+ chart.innerHTML=grid+'<path d="'+path+'" fill="none" stroke="#58a6ff" stroke-width="2"/>'+dots;
+ const suiteIds=[...new Set(runs.flatMap(r=>(r.suites||[]).map(s=>s.id)))];
+ let head='<tr><th>run</th><th>overall</th>'+suiteIds.map(s=>'<th>'+s+'</th>').join("")+'</tr>';
+ let rows=runs.slice().reverse().map(r=>{
+  const cells=suiteIds.map(id=>{const su=(r.suites||[]).find(s=>s.id===id);
+   if(!su)return '<td>-</td>';
+   if(su.skipped)return '<td class="skip">skip</td>';
+   if(su.error)return '<td class="fail">err</td>';
+   const cls=su.passed?"pass":"fail";
+   return '<td class="score '+cls+'">'+(su.score==null?"-":su.score.toFixed(1))+'</td>';});
+  const ov=r.overall_score==null?"-":r.overall_score.toFixed(1);
+  return '<tr><td>'+r.ts.replace("T"," ").slice(0,16)+'</td><td class="score '+(r.passed?"pass":"fail")+'">'+ov+'</td>'+cells.join("")+'</tr>';
+ }).join("");
+ tbl.innerHTML='<table>'+head+rows+'</table>';
+}
+load();
+</script></body></html>"""
+
+
+@app.get("/hermesbench", response_class=HTMLResponse)
+async def hermesbench_page(request: Request):
+    base = ""
+    html = (
+        _HERMESBENCH_PAGE
+        .replace("__TOKEN__", _SESSION_TOKEN)
+        .replace("__HEADER__", _SESSION_HEADER_NAME)
+        .replace("__BASE__", base)
+    )
+    return HTMLResponse(html)
+
+
 mount_spa(app)
 
 

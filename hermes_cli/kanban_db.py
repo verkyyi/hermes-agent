@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import filecmp
 import json
 import os
 import re
@@ -120,6 +121,14 @@ _IS_WINDOWS = sys.platform == "win32"
 # long single-call MCP workflows.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 DEFAULT_DIAGNOSTIC_TAIL_BYTES = 4096
+
+# Default live concurrency cap for the gateway dispatcher when
+# ``kanban.max_spawn`` is unset. Bounds how many worker subprocesses can be
+# 'running' at once across a board. Without a cap the dispatcher fans out to
+# one process per ready task — a post-restart backlog once spawned 26 workers
+# that all opened the WAL DB concurrently and tore a checkpoint, corrupting
+# kanban.db (2026-05-27). Override via config.yaml ``kanban.max_spawn``.
+DEFAULT_MAX_SPAWN = 4
 
 
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
@@ -1086,6 +1095,23 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     resolved = path.resolve()
     parent = resolved.parent
     base_name = resolved.name  # basename only
+    # Dedup: if a byte-identical backup of this exact corrupt state already
+    # exists, reuse it instead of writing another copy. The corruption guard
+    # runs on every uncached connect(), so without this a retry loop across the
+    # dispatcher and many worker processes writes hundreds of identical
+    # multi-MB backups and fills the disk (865 files / ~2.6 GB on 2026-05-27).
+    try:
+        src_size = resolved.stat().st_size
+        for existing in sorted(parent.glob(f"{base_name}.corrupt.*.bak")):
+            try:
+                if existing.stat().st_size == src_size and filecmp.cmp(
+                    resolved, existing, shallow=False
+                ):
+                    return existing
+            except OSError:
+                continue
+    except OSError:
+        pass
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     candidate = parent / f"{base_name}.corrupt.{stamp}.bak"
     # Defensive: candidate must still be inside parent after construction.
@@ -1229,6 +1255,15 @@ def connect(
             # crash window that can leave a b-tree page header torn.
             conn.execute("PRAGMA synchronous=FULL")
             conn.execute("PRAGMA wal_autocheckpoint=100")
+            # macOS: a plain fsync() only flushes writes to the drive's volatile
+            # cache, not through it to stable storage. A power loss / kernel
+            # panic / forced sleep mid-checkpoint can then leave the main DB
+            # file extended with pages that never actually reached the platter,
+            # producing dangling b-tree page pointers (the 2026-05-27 "page
+            # number beyond EOF" corruption). checkpoint_fullfsync makes the
+            # WAL->DB checkpoint use F_FULLFSYNC, which flushes through the
+            # cache. No-op on platforms without F_FULLFSYNC.
+            conn.execute("PRAGMA checkpoint_fullfsync=ON")
             conn.execute("PRAGMA foreign_keys=ON")
             # Zero freed pages so a later torn write cannot expose stale
             # cell content; persisted in the DB header for new DBs.

@@ -246,3 +246,30 @@ def test_add_notify_sub_upserts_without_resetting_cursor(kanban_home):
     assert row["user_id"] == "u1"                      # preserved (omitted)
     assert row["last_event_id"] == 99                  # cursor NOT reset
     assert row["created_at"] == before["created_at"]   # creation time preserved
+
+
+def test_backup_corrupt_db_dedups_identical_state(tmp_path):
+    """Re-backing-up an unchanged corrupt DB must reuse the existing backup.
+
+    Regression for the 2026-05-27 incident: the corruption guard runs on every
+    uncached connect(), so a retry loop across the dispatcher and many worker
+    processes wrote 865 identical ~3 MB backups (~2.6 GB) and filled the disk.
+    _backup_corrupt_db must return the existing byte-identical backup instead
+    of creating a duplicate, while still backing up a genuinely new state.
+    """
+    db = tmp_path / "kanban.db"
+    db.write_bytes(b"corrupt-bytes" * 100)
+
+    first = kb._backup_corrupt_db(db)
+    assert first is not None and first.exists()
+
+    # Same corrupt content -> no second backup file is created.
+    second = kb._backup_corrupt_db(db)
+    assert second == first
+    assert len(list(tmp_path.glob("kanban.db.corrupt.*.bak"))) == 1
+
+    # Different corrupt content -> a fresh backup is made.
+    db.write_bytes(b"different-corrupt" * 100)
+    third = kb._backup_corrupt_db(db)
+    assert third is not None and third != first
+    assert len(list(tmp_path.glob("kanban.db.corrupt.*.bak"))) == 2

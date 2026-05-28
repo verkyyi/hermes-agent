@@ -5198,10 +5198,29 @@ class GatewayRunner(KanbanSynthesisMixin, KanbanNotifierMixin, ForkLocalGatewayM
         interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
-        # Read max_spawn config to limit concurrent kanban tasks
-        max_spawn = kanban_cfg.get("max_spawn", None)
-        if max_spawn is not None:
-            logger.info(f"kanban dispatcher: max_spawn={max_spawn}")
+        # Live concurrency cap on worker subprocesses. Defaults to
+        # _kb.DEFAULT_MAX_SPAWN when unset so the dispatcher never fans out to
+        # one process per ready task: an uncapped post-restart backlog spawned
+        # 26 workers that all opened the WAL DB at once and tore a checkpoint,
+        # corrupting kanban.db (2026-05-27). To raise the ceiling set a higher
+        # positive kanban.max_spawn; invalid or <1 values fall back to the
+        # default rather than silently restoring the unbounded behavior.
+        raw_max_spawn = kanban_cfg.get("max_spawn", _kb.DEFAULT_MAX_SPAWN)
+        try:
+            max_spawn = int(raw_max_spawn)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.max_spawn=%r; using default %d",
+                raw_max_spawn, _kb.DEFAULT_MAX_SPAWN,
+            )
+            max_spawn = _kb.DEFAULT_MAX_SPAWN
+        if max_spawn < 1:
+            logger.warning(
+                "kanban dispatcher: kanban.max_spawn=%r is below 1; using default %d",
+                raw_max_spawn, _kb.DEFAULT_MAX_SPAWN,
+            )
+            max_spawn = _kb.DEFAULT_MAX_SPAWN
+        logger.info(f"kanban dispatcher: max_spawn={max_spawn}")
 
         # Cap the number of simultaneously running tasks so slow workers
         # (local LLMs, resource-constrained hosts) don't pile up and time

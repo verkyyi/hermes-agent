@@ -4047,6 +4047,7 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    allow_running: bool = False,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -4054,6 +4055,12 @@ def decompose_triage_task(
     when all children reach ``done``, the root promotes to ``ready`` and
     its assignee (typically the orchestrator profile) wakes back up to
     judge completion or spawn more work.
+
+    ``allow_running=True`` additionally permits a ``running`` root to
+    *self-decompose* — an orchestrator fanning out its own in-flight task.
+    The active run is ended (``outcome='decomposed'``) and the claim
+    released before the root is parked at ``todo``, so the worker's clean
+    process exit is not mis-classified as a protocol violation.
 
     ``children`` is a list of dicts, each shaped like::
 
@@ -4067,7 +4074,7 @@ def decompose_triage_task(
     Returns the list of created child task ids (in input order) on
     success. Returns ``None`` when:
       - The root task does not exist
-      - The root task is not in ``triage``
+      - The root task is not in ``triage`` (nor ``running`` with ``allow_running``)
       - A cycle would result (caller built a bad graph)
 
     Validation of titles/assignees happens inside the same write_txn as
@@ -4136,7 +4143,22 @@ def decompose_triage_task(
         ).fetchone()
         if root_row is None:
             return None
-        if root_row["status"] != "triage":
+        root_status = root_row["status"]
+        if root_status == "triage":
+            pass
+        elif root_status == "running" and allow_running:
+            # Self-park: an orchestrator decomposing its own in-flight task.
+            # End the active run + release the claim *before* parking the root
+            # at 'todo' (below), so the worker's subsequent clean exit is not
+            # mis-classified as a protocol violation — detect_crashed_workers
+            # and _classify_worker_exit only consider tasks still in 'running'.
+            _end_run(
+                conn, task_id,
+                outcome="decomposed",
+                status="decomposed",
+                summary="self-decomposed into children; awaiting fan-in",
+            )
+        else:
             return None
         tenant = root_row["tenant"]
 
@@ -4196,8 +4218,17 @@ def decompose_triage_task(
                 (cid, task_id),
             )
 
-        # Flip the root: triage -> todo, set assignee to the orchestrator.
-        sets = ["status = 'todo'"]
+        # Flip the root: -> todo, set assignee to the orchestrator, and clear
+        # any task-level claim/pid (set when self-parking a running root) so the
+        # parked anchor is seen as neither an active nor a crashed worker. The
+        # claim columns are already NULL for a triage root, so this is a no-op
+        # there.
+        sets = [
+            "status = 'todo'",
+            "claim_lock = NULL",
+            "claim_expires = NULL",
+            "worker_pid = NULL",
+        ]
         params: list[Any] = []
         if root_assignee is not None:
             sets.append("assignee = ?")

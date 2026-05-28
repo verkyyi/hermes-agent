@@ -970,6 +970,95 @@ def _handle_link(args: dict, **kw) -> str:
         return tool_error(f"kanban_link: {e}")
 
 
+def _handle_decompose(args: dict, **kw) -> str:
+    """Fan the current task out into a child graph and self-park as the anchor.
+
+    The orchestrator calls this on its own dispatched task
+    (``HERMES_KANBAN_TASK``): it creates the child graph, links the current task
+    as a child of every leaf (so it waits for the whole graph), and parks itself
+    at ``todo``. When all children finish, the dependency engine re-promotes the
+    anchor and the dispatcher re-spawns this same profile to judge/aggregate
+    (Path A). The active run is ended cleanly so the worker's process exit is not
+    a protocol violation.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id:
+        return tool_error(
+            "kanban_decompose self-parks the current task, but HERMES_KANBAN_TASK "
+            "is not set — this tool is for an orchestrator running as a dispatched "
+            "kanban task. Use kanban_create for ad-hoc task creation."
+        )
+    children = args.get("children")
+    if not isinstance(children, list) or not children:
+        return tool_error(
+            "children must be a non-empty list of "
+            "{title, assignee, body?, parents?} objects"
+        )
+    norm: list[dict] = []
+    for idx, child in enumerate(children):
+        if not isinstance(child, dict):
+            return tool_error(f"children[{idx}] must be an object")
+        title = child.get("title")
+        if not isinstance(title, str) or not title.strip():
+            return tool_error(f"children[{idx}].title is required")
+        assignee = child.get("assignee")
+        if not assignee or not str(assignee).strip():
+            return tool_error(
+                f"children[{idx}].assignee is required — name the profile that "
+                "should execute this child (unassigned tasks are never dispatched)"
+            )
+        parents = child.get("parents") or []
+        if isinstance(parents, int):
+            parents = [parents]
+        if not isinstance(parents, list) or not all(isinstance(p, int) for p in parents):
+            return tool_error(
+                f"children[{idx}].parents must be a list of integer indices into "
+                "the children list (not task ids)"
+            )
+        norm.append({
+            "title": title,
+            "body": child.get("body"),
+            "assignee": str(assignee),
+            "parents": parents,
+        })
+    board = args.get("board")
+    root_assignee = os.environ.get("HERMES_PROFILE") or None
+    author = os.environ.get("HERMES_PROFILE") or "orchestrator"
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            child_ids = kb.decompose_triage_task(
+                conn,
+                task_id,
+                root_assignee=root_assignee,
+                children=norm,
+                author=author,
+                allow_running=True,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_decompose: {e}")
+    except Exception as e:
+        logger.exception("kanban_decompose failed")
+        return tool_error(f"kanban_decompose: {e}")
+    if child_ids is None:
+        return tool_error(
+            f"kanban_decompose: task {task_id} could not be decomposed "
+            "(not found, or not in a decomposable status: triage/running)"
+        )
+    return _ok(
+        task_id=task_id,
+        children=child_ids,
+        parked=True,
+        note=(
+            "Fanned out and self-parked as the fan-in anchor. You will be "
+            "re-dispatched on this task once all children complete — aggregate "
+            "their handoffs and complete the task THEN. Do not complete now."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -1405,6 +1494,69 @@ KANBAN_UNBLOCK_SCHEMA = {
     },
 }
 
+KANBAN_DECOMPOSE_SCHEMA = {
+    "name": "kanban_decompose",
+    "description": (
+        "Fan your CURRENT task out into a child-task graph and self-park as the "
+        "fan-in anchor — the orchestrator's primary fan-out tool. Unlike "
+        "kanban_create followed by completing yourself, this keeps your task "
+        "alive as the parent of the whole graph: it is parked at 'todo' and "
+        "automatically re-promoted (you are re-dispatched on it) once EVERY child "
+        "completes, so you can judge the results and either finish or spawn more "
+        "work. Do NOT call kanban_complete in the same turn you decompose — "
+        "complete only after you are re-dispatched and the children are done. "
+        "Operates on your task (HERMES_KANBAN_TASK)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "children": {
+                "type": "array",
+                "description": (
+                    "Child tasks to fan out. Lanes with no 'parents' run in "
+                    "parallel; a lane with 'parents' waits for those siblings."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Short child task title (required).",
+                        },
+                        "assignee": {
+                            "type": "string",
+                            "description": (
+                                "Profile that executes this child (required) — "
+                                "unassigned tasks are never dispatched."
+                            ),
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": (
+                                "Full spec the assigned worker reads with no "
+                                "other context: goal, approach, acceptance."
+                            ),
+                        },
+                        "parents": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": (
+                                "0-based INDICES into THIS children list (not task "
+                                "ids) expressing data dependencies. A synthesis/"
+                                "fan-in child lists every lane index it depends on. "
+                                "Omit for parallel lanes."
+                            ),
+                        },
+                    },
+                    "required": ["title", "assignee"],
+                },
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["children"],
+    },
+}
+
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
@@ -1489,6 +1641,15 @@ registry.register(
     handler=_handle_create,
     check_fn=_check_kanban_mode,
     emoji="➕",
+)
+
+registry.register(
+    name="kanban_decompose",
+    toolset="kanban",
+    schema=KANBAN_DECOMPOSE_SCHEMA,
+    handler=_handle_decompose,
+    check_fn=_check_kanban_mode,
+    emoji="🌿",
 )
 
 registry.register(

@@ -145,7 +145,11 @@ class TestGetAuthUrl:
 
         flow = FakeFlow.created[-1]
         assert flow.autogenerate_code_verifier is True
-        assert flow.authorization_kwargs == {"access_type": "offline", "prompt": "consent"}
+        assert flow.authorization_kwargs == {
+            "access_type": "offline",
+            "prompt": "consent",
+            "include_granted_scopes": "true",
+        }
 
 
 class TestExchangeAuthCode:
@@ -226,6 +230,9 @@ class TestExchangeAuthCode:
 
         out = capsys.readouterr().out
         assert "token exchange failed" in out.lower()
+        # On failure the code may be spent/expired, so a fresh auth URL is
+        # printed for the user to retry with rather than leaving them stuck.
+        assert "https://auth.example/authorize?state=generated-state" in out
         assert setup_module.PENDING_AUTH_PATH.exists()
         assert not setup_module.TOKEN_PATH.exists()
 
@@ -256,6 +263,46 @@ class TestExchangeAuthCode:
         assert setup_module.TOKEN_PATH.exists()
         # Pending auth is cleaned up
         assert not setup_module.PENDING_AUTH_PATH.exists()
+
+
+class TestServiceScopeSelection:
+    """`--services` requests only the scopes a profile needs (least privilege),
+    and `--format json` emits machine-readable payloads."""
+
+    def test_services_filter_requested_scopes(self, setup_module, capsys):
+        setup_module.get_auth_url(services="calendar,drive")
+
+        assert capsys.readouterr().out.strip() == "https://auth.example/authorize?state=generated-state"
+        flow = FakeFlow.created[-1]
+        assert flow.scopes == [
+            "https://www.googleapis.com/auth/calendar",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ]
+
+    def test_json_format_outputs_auth_url_payload(self, setup_module, capsys):
+        setup_module.get_auth_url(services="calendar", output_format="json")
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["auth_url"] == "https://auth.example/authorize?state=generated-state"
+        assert payload["services"] == "calendar"
+        assert payload["scopes"] == ["https://www.googleapis.com/auth/calendar"]
+
+    def test_json_failure_returns_fresh_auth_url(self, setup_module, capsys):
+        setup_module.PENDING_AUTH_PATH.write_text(
+            json.dumps({"state": "saved-state", "code_verifier": "saved-verifier"})
+        )
+        FakeFlow.fetch_error = Exception("invalid_grant: Code was already redeemed")
+
+        with pytest.raises(SystemExit):
+            setup_module.exchange_auth_code(
+                "4/test-auth-code", output_format="json", services="calendar"
+            )
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert payload["error"] == "token_exchange_failed"
+        assert payload["fresh_auth_url"] == "https://auth.example/authorize?state=generated-state"
+        assert FakeFlow.created[-1].scopes == ["https://www.googleapis.com/auth/calendar"]
 
 
 class TestHermesConstantsFallback:

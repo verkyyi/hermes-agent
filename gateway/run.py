@@ -407,6 +407,110 @@ def _should_send_telegram_pre_llm_ack(text: str, *, is_command: bool = False) ->
     return _should_send_pre_llm_ack(text, is_command=is_command)
 
 
+# --- Phase 2 TTFA: context-aware LLM upgrade of the deterministic ack --------
+#
+# The deterministic ack ("Got it — checking.") is sent first to stay inside the
+# sub-300ms TTFF budget the responsiveness benchmark asserts.  Once that bubble
+# exists we asynchronously ask the LLM for a one-line ack grounded in what the
+# user actually said, then EDIT the bubble in place.  The call goes through the
+# provider-agnostic auxiliary client (mirroring the main agent's provider/model,
+# so it works on Codex, Anthropic, OpenAI-wire, etc.), never sits on the critical
+# path, and degrades to the deterministic ack on any failure.
+_LLM_ACK_DEFAULT_TIMEOUT_S = 6.0
+_LLM_ACK_MAX_CHARS = 100
+_LLM_ACK_SYSTEM_PROMPT = (
+    "You write ONE short acknowledgement line that a personal AI assistant "
+    "sends the instant it begins working on a request, before it has any "
+    "results yet. Rules:\n"
+    "- Output exactly one line, at most 80 characters, no line breaks.\n"
+    "- Restate what you are about to do, grounded in the user's message, in "
+    "present-continuous tense (e.g. \"On it — checking the gateway logs now.\").\n"
+    "- Reply in the SAME language as the user's message.\n"
+    "- Do NOT answer the request, promise specific findings, give an ETA, or "
+    "add greetings/pleasantries.\n"
+    "- No quotes, no emoji, no markdown. Output only the line."
+)
+
+
+def _resolve_llm_ack_config() -> dict:
+    """Resolve config for the context-aware ack upgrade.
+
+    Reads ``responsiveness.llm_ack.{enabled,model,timeout_s}`` from config.yaml,
+    with ``HERMES_RESP_LLM_ACK`` / ``HERMES_RESP_LLM_ACK_MODEL`` /
+    ``HERMES_RESP_LLM_ACK_TIMEOUT_S`` env overrides (the env knobs let the
+    responsiveness benchmark and e2e harness force the feature on/off
+    deterministically).  Enabled by default.  ``model`` is empty by default,
+    meaning "use the main agent's model" — only set it to pin a cheaper/faster
+    model that the active provider actually serves.
+    """
+    section: dict = {}
+    try:
+        cfg = _load_gateway_config()
+        resp = cfg.get("responsiveness") if isinstance(cfg, dict) else None
+        if isinstance(resp, dict) and isinstance(resp.get("llm_ack"), dict):
+            section = resp["llm_ack"]
+    except Exception:
+        section = {}
+
+    enabled = bool(section.get("enabled", True))
+    env_enabled = os.getenv("HERMES_RESP_LLM_ACK")
+    if env_enabled is not None:
+        enabled = env_enabled.strip().lower() in {"1", "true", "yes", "on"}
+
+    model = os.getenv("HERMES_RESP_LLM_ACK_MODEL") or section.get("model") or ""
+    timeout_s = _float_env(
+        "HERMES_RESP_LLM_ACK_TIMEOUT_S",
+        section.get("timeout_s", _LLM_ACK_DEFAULT_TIMEOUT_S),
+    )
+    return {
+        "enabled": enabled,
+        "model": str(model),
+        "timeout_s": float(timeout_s) if timeout_s and timeout_s > 0 else _LLM_ACK_DEFAULT_TIMEOUT_S,
+    }
+
+
+async def _compose_llm_ack(message_text: str, ack_cfg: dict) -> Optional[str]:
+    """Ask the LLM for a one-line, context-aware ack.  Returns the line or None.
+
+    Routes through the provider-agnostic auxiliary client mirroring the main
+    agent's runtime, so it works regardless of provider (Codex, Anthropic,
+    OpenAI-wire, …).  Returns None on any failure so the caller keeps the
+    deterministic ack.
+    """
+    from agent.auxiliary_client import get_async_text_auxiliary_client
+
+    try:
+        runtime = dict(_resolve_runtime_agent_kwargs())
+    except Exception:
+        return None
+    if not runtime.get("model"):
+        runtime["model"] = _resolve_gateway_model()
+
+    client, resolved_model = get_async_text_auxiliary_client(task="", main_runtime=runtime)
+    if client is None:
+        return None
+    model = ack_cfg.get("model") or resolved_model
+    if not model:
+        return None
+
+    resp = await client.chat.completions.create(
+        model=model,
+        max_tokens=64,
+        messages=[
+            {"role": "system", "content": _LLM_ACK_SYSTEM_PROMPT},
+            {"role": "user", "content": (message_text or "")[:1000]},
+        ],
+    )
+    try:
+        content = resp.choices[0].message.content or ""
+    except (AttributeError, IndexError, TypeError):
+        return None
+    # Collapse any whitespace/newlines into a single clean line, strip stray
+    # wrapping quotes the model sometimes adds despite the instruction.
+    line = " ".join(content.split()).strip().strip('"').strip()
+    return line[:_LLM_ACK_MAX_CHARS] or None
+
+
 _PUBLIC_LONG_PROGRESS_PLATFORMS = {"telegram", "weixin"}
 _PUBLIC_LONG_PROGRESS_DEFAULT_INITIAL_DELAY_S = 90.0
 _PUBLIC_LONG_PROGRESS_MIN_INTERVAL_S = 120.0
@@ -2043,6 +2147,10 @@ class GatewayRunner(KanbanSynthesisMixin, KanbanNotifierMixin, ForkLocalGatewayM
         self._exit_reason: Optional[str] = None
         self._exit_code: Optional[int] = None
         self._draining = False
+        # Background tasks that upgrade the deterministic pre-LLM ack into a
+        # context-aware one-liner (see _upgrade_ack_with_llm).  Held so the
+        # event loop does not garbage-collect them mid-flight.
+        self._ack_upgrade_tasks: set = set()
         self._restart_requested = False
         self._restart_task_started = False
         self._restart_detached = False
@@ -8052,6 +8160,68 @@ class GatewayRunner(KanbanSynthesisMixin, KanbanNotifierMixin, ForkLocalGatewayM
                 pass
         return source
 
+    async def _upgrade_ack_with_llm(
+        self,
+        *,
+        adapter,
+        chat_id,
+        message_id,
+        message_text: str,
+        thread_id=None,
+        gateway_request_id: str | None = None,
+    ) -> None:
+        """Best-effort: replace the deterministic ack bubble with a context-aware
+        one-liner produced by a fast model.
+
+        Runs as a detached background task so it never delays the main agent
+        run.  Any failure (config disabled, non-Anthropic provider, model error,
+        edit failure) silently leaves the deterministic ack in place.
+        """
+        _start_ms = int(time.time() * 1000)
+        _status = "ok"
+        _error = None
+        _ack_len = 0
+        try:
+            ack_cfg = _resolve_llm_ack_config()
+            if not ack_cfg.get("enabled"):
+                return
+            editor = getattr(adapter, "edit_message", None)
+            if not callable(editor) or not message_id or not chat_id:
+                return
+            line = await asyncio.wait_for(
+                _compose_llm_ack(message_text, ack_cfg),
+                timeout=float(ack_cfg["timeout_s"]) + 1.0,
+            )
+            if not line:
+                _status = "empty"
+                return
+            _ack_len = len(line)
+            _edit_meta = {"thread_id": thread_id} if thread_id else None
+            await editor(chat_id, message_id, line, finalize=True, metadata=_edit_meta)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _status = "error"
+            _error = str(exc)[:300]
+            logger.debug("LLM ack upgrade skipped: %s", exc)
+        finally:
+            try:
+                _record_gateway_telemetry_span(
+                    "gateway.pre_llm_ack.llm_upgrade",
+                    platform="gateway",
+                    status="ok" if _status == "ok" else "error",
+                    error=_error,
+                    attributes={
+                        "gateway_request_id": gateway_request_id,
+                        "upgrade_status": _status,
+                        "ack_len": _ack_len,
+                    },
+                    started_at_ms=_start_ms,
+                    ended_at_ms=int(time.time() * 1000),
+                )
+            except Exception:
+                pass
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -8690,6 +8860,7 @@ class GatewayRunner(KanbanSynthesisMixin, KanbanNotifierMixin, ForkLocalGatewayM
                 _ack_meta = {"thread_id": source.thread_id} if source.thread_id else None
                 _ack_start_ms = int(time.time() * 1000)
                 _ack_error = None
+                _ack_message_id = None
                 try:
                     if _ack_adapter and source.chat_id:
                         _ack_result = await _ack_adapter.send(
@@ -8699,6 +8870,7 @@ class GatewayRunner(KanbanSynthesisMixin, KanbanNotifierMixin, ForkLocalGatewayM
                         )
                         _pre_llm_ack_send_success = bool(getattr(_ack_result, "success", False))
                         _pre_llm_ack_sent = _pre_llm_ack_send_success
+                        _ack_message_id = getattr(_ack_result, "message_id", None)
                         if not _pre_llm_ack_send_success:
                             _ack_error = str(getattr(_ack_result, "error", "send returned failure") or "send returned failure")[:300]
                     else:
@@ -8723,6 +8895,30 @@ class GatewayRunner(KanbanSynthesisMixin, KanbanNotifierMixin, ForkLocalGatewayM
                     started_at_ms=_ack_start_ms,
                     ended_at_ms=_ack_end_ms,
                 )
+                # Phase 2 TTFA: off the critical path, upgrade the just-sent
+                # deterministic ack into a context-aware one-liner and edit the
+                # bubble in place.  Only when the adapter supports editing
+                # (Telegram does; Weixin does not).  Fully best-effort.
+                if (
+                    _pre_llm_ack_sent
+                    and _ack_message_id
+                    and callable(getattr(_ack_adapter, "edit_message", None))
+                ):
+                    try:
+                        _ack_upgrade_task = asyncio.create_task(
+                            self._upgrade_ack_with_llm(
+                                adapter=_ack_adapter,
+                                chat_id=source.chat_id,
+                                message_id=_ack_message_id,
+                                message_text=message_text,
+                                thread_id=source.thread_id,
+                                gateway_request_id=_gateway_request_id,
+                            )
+                        )
+                        self._ack_upgrade_tasks.add(_ack_upgrade_task)
+                        _ack_upgrade_task.add_done_callback(self._ack_upgrade_tasks.discard)
+                    except Exception as _ack_upgrade_spawn_exc:
+                        logger.debug("failed to spawn LLM ack upgrade: %s", _ack_upgrade_spawn_exc)
         else:
             _record_gateway_telemetry_span(
                 "gateway.pre_llm_ack.decision",

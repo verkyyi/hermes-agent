@@ -3258,6 +3258,51 @@ def recover_complete_task(
     return True
 
 
+def _propagate_origin_subs_to_children(conn: sqlite3.Connection, task_id: str) -> int:
+    """Move a completing router task's origin notify subscription to its pending
+    children so the user's answer returns from the task that holds it.
+
+    No-op for leaf tasks (no children) and for tasks whose children are already
+    ``done``/``archived`` (the completing task IS the deliverable — keep the sub
+    so its completion delivers). Returns the number of (child, sub) rows added.
+    See ``complete_task`` for how this composes with self-park.
+    """
+    subs = list_notify_subs(conn, task_id)
+    if not subs:
+        return 0
+    rows = conn.execute(
+        "SELECT t.id AS id FROM task_links l JOIN tasks t ON t.id = l.child_id "
+        "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived')",
+        (task_id,),
+    ).fetchall()
+    children = [r["id"] for r in rows]
+    if not children:
+        return 0
+    moved = 0
+    for child in children:
+        for sub in subs:
+            add_notify_sub(
+                conn,
+                task_id=child,
+                platform=sub.get("platform"),
+                chat_id=sub.get("chat_id"),
+                thread_id=sub.get("thread_id") or None,
+                user_id=sub.get("user_id"),
+                notification_mode=sub.get("notification_mode"),
+                origin_session_id=sub.get("origin_session_id"),
+                origin_profile=sub.get("origin_profile"),
+                origin_context=sub.get("origin_context"),
+                request_id=sub.get("request_id"),
+                notifier_profile=sub.get("notifier_profile"),
+            )
+            moved += 1
+    # Remove from the completing task so its routing-only completion does not
+    # also deliver (avoids a duplicate/non-answer ping to the origin).
+    with write_txn(conn):
+        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+    return moved
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3456,6 +3501,15 @@ def complete_task(
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
+    # Origin-return safety net: if this task carries an origin notification
+    # subscription AND it delegated the work to still-pending children (a
+    # router/orchestrator task — told not to do the work itself), move the
+    # subscription onto those children so the user's answer returns from the
+    # task that actually holds it, not from this task's routing-only summary.
+    # Composes with self-park: a parked anchor isn't 'done' here, so nothing
+    # moves; when it later aggregates and completes, its children are already
+    # 'done' (not pending) so the subscription stays and delivers the aggregate.
+    _propagate_origin_subs_to_children(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.

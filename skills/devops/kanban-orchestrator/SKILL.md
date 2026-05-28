@@ -145,7 +145,7 @@ kanban_decompose(children=[
 
 `parents` gates promotion — a child stays in `todo` until every listed sibling reaches `done`, then auto-promotes to `ready`. The dispatcher and dependency engine handle all ordering, and `kanban_decompose` writes the graph atomically so there is no window where a child is claimed before its inputs exist.
 
-> Plain `kanban_create(..., parents=[<task_ids>])` is the manual equivalent (there `parents` are task ids captured from prior `kanban_create` calls). Use it only for an ad-hoc single follow-up that doesn't need you to aggregate — for a real fan-out/fan-in, `kanban_decompose` is simpler and self-parks you correctly.
+> Use `kanban_decompose` to delegate the work your task is about — **even when it's a single sub-task** — because it self-parks your task as the return anchor. Plain `kanban_create(..., parents=[<task_ids>])` does NOT self-park: if you `kanban_create` the work and then `kanban_complete` your own task, you abandon the anchor and the real answer never returns to whoever asked. Reserve `kanban_create` for incidental side-tasks whose results don't need to come back through you.
 
 ### Step 4 — You are parked; do NOT complete yet
 

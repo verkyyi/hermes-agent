@@ -28,8 +28,8 @@ def test_kanban_guidance_orchestrator_mode_prefers_decompose():
     assert "kanban_decompose" in text
     # The self-park / fan-in anchor contract must be stated.
     assert "anchor" in text
-    # The critical rule: do not complete in the same turn you decompose.
-    assert "do not call `kanban_complete`" in text
+    # The critical rule: don't kanban_create the work then complete your own task.
+    assert "never" in text and "kanban_complete" in text
 
 
 def test_orchestrator_skill_documents_decompose_self_park():

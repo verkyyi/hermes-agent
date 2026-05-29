@@ -1,0 +1,14 @@
+{
+  "name": "hermesbench",
+  "label": "HermesBench",
+  "description": "Consolidated daily benchmark — overall score trend over time, per-suite breakdown.",
+  "icon": "Activity",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/hermesbench",
+    "position": "after:skills"
+  },
+  "slots": [],
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

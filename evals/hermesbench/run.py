@@ -1,14 +1,14 @@
 """HermesBench — single consolidated benchmark runner.
 
-    venv/bin/python -m evals.hermesbench.run                 # run all suites
-    venv/bin/python -m evals.hermesbench.run --suite responsiveness,kanban_scale
+    HERMES_RUN_LLM_EVALS=1 venv/bin/python -m evals.hermesbench.run   # all use cases
+    venv/bin/python -m evals.hermesbench.run --suite refusal,ambiguous
     venv/bin/python -m evals.hermesbench.run --json          # machine-readable
     venv/bin/python -m evals.hermesbench.run --no-store      # don't persist
 
-Runs every registered suite. The model-backed suites (orchestrator,
-origin_return) self-skip when HERMES_RUN_LLM_EVALS is unset, so a creds-less run
-degrades cleanly to the deterministic suites and is recorded as skipped (not
-failed). Exits non-zero if any suite that actually ran failed.
+Runs every registered use-case suite. All suites drive a real agent, so they
+self-skip when HERMES_RUN_LLM_EVALS is unset (a creds-less run records every
+suite as skipped, not failed). Exits non-zero if any suite that actually ran
+failed.
 """
 
 from __future__ import annotations

@@ -1,50 +1,54 @@
-# HermesBench — consolidated daily benchmark
+# HermesBench — black-box reliability benchmark (default profile)
 
-> **Methodology:** for the detailed, human-readable explanation of what each
-> suite measures, how scores and pass/fail are computed, the thresholds, and how
-> to read the dashboard, see **[METHODOLOGY.md](METHODOLOGY.md)**. This file is
-> the operational quick-reference.
+> **Methodology:** for the full explanation — what's measured, the mechanical-vs-
+> judge split, scoring/closure-gate formulas, and how to read the dashboard —
+> see **[METHODOLOGY.md](METHODOLOGY.md)**. This file is the quick-reference.
 
-One runner that wraps the fork's scattered eval harnesses behind a single
-registry, persists every run to a SQLite trend store, and renders a daily
-summary with deltas vs the prior run. Built to run every day on the local
-default profile.
+A black-box benchmark for the **default profile** (the front-desk assistant the
+user talks to). It drives the agent as an end user — sends a prompt, judges what
+comes back — and **never inspects internal mechanics** (kanban/orchestrator).
+It weights **reliability / responsiveness / closure above capability**, and its
+headline contract is: **every prompt reaches a genuine conclusion** (answered,
+refused, or clarified — never a hang or silent drop). Persists each run to a
+SQLite trend store with a daily summary + dashboard.
 
 ## Run it
 
 ```bash
-# Runs every suite. The model-backed suites (orchestrator, origin_return)
-# self-skip unless HERMES_RUN_LLM_EVALS is set, so this degrades cleanly to
-# the two deterministic suites without credentials.
-venv/bin/python -m evals.hermesbench.run
+# Every suite drives a real agent, so all suites self-skip without creds.
+HERMES_RUN_LLM_EVALS=1 venv/bin/python -m evals.hermesbench.run
 
-HERMES_RUN_LLM_EVALS=1 venv/bin/python -m evals.hermesbench.run   # incl. model suites
-venv/bin/python -m evals.hermesbench.run --suite responsiveness,kanban_scale  # subset
+venv/bin/python -m evals.hermesbench.run                  # no creds -> all skip
+HERMES_RUN_LLM_EVALS=1 venv/bin/python -m evals.hermesbench.run --suite refusal,ambiguous
+HERMES_RUN_LLM_EVALS=1 HERMES_BENCH_TRIALS=3 venv/bin/python -m evals.hermesbench.run
 venv/bin/python -m evals.hermesbench.run --json           # machine-readable
 venv/bin/python -m evals.hermesbench.run --no-store       # don't persist
 ```
 
-Exit code is non-zero if any suite that actually ran failed.
+Exit code is non-zero if any suite that actually ran failed. Tunables:
+`HERMES_BENCH_TRIALS` (default 2), `HERMES_BENCH_CONCURRENCY` (4),
+`HERMES_BENCH_APPROPRIATE_PASS` (0.7).
 
-## Suites
+## Suites (use-case categories)
 
-| id | category | mode | needs a model? |
+| id | label | expectation | needs a model? |
 |---|---|---|---|
-| `responsiveness` | Front-desk responsiveness | automated | no |
-| `kanban_scale`   | Kanban kernel scale       | automated | no |
-| `orchestrator`   | Orchestration & routing   | hybrid    | yes |
-| `origin_return`  | End-to-end task return    | llm_judge | yes |
+| `direct_answer` | Direct answer | answers the question | yes |
+| `quick_task`    | Quick task | does the small task in-turn | yes |
+| `multistep`     | Multi-step reasoning | synthesizes a result | yes |
+| `ambiguous`     | Ambiguous → clarify | asks, doesn't guess | yes |
+| `refusal`       | Refusal → clear decline | declines, doesn't fabricate | yes |
 
-Suites *wrap* the existing harnesses (`evals/responsiveness`,
-`tests/stress/test_benchmarks.py`, `evals/orchestrator_routing`,
-`evals/origin_return`) — those still run standalone. `kanban_scale` runs the
-stress benchmark in an isolated subprocess because it mutates `HERMES_HOME`.
+Each suite drives the default profile in an **isolated turn**
+(`harness.py` → `hermes chat -q … --quiet` in a throwaway `HERMES_HOME`), then an
+**LLM judge** (`judge.py`) rules on the reply. Every suite is `hybrid`:
+mechanical reliability signals (responded / latency / stable / concluded) +
+judged conclusion-type / appropriateness / coherence. No tier concept; all
+suites self-skip without `HERMES_RUN_LLM_EVALS`. The dataset is `usecases.py`.
 
-Grading modes mirror ClawBench Core v1: `automated` (deterministic),
-`llm_judge`, `hybrid`. There is **no tier concept** — every suite runs each
-time; the model-backed suites self-skip without `HERMES_RUN_LLM_EVALS` (so a
-creds-less run = the two deterministic suites). See
-[METHODOLOGY.md](METHODOLOGY.md) for details.
+The old architecture-coupled internal evals (kanban scale, orchestrator routing,
+origin-return) were **retired from the bench** — they still exist standalone
+under `evals/` and `tests/stress` for ad-hoc internal checks.
 
 ## Trend store + dashboard
 
@@ -82,11 +86,13 @@ launchctl bootout gui/$(id -u)/ai.hermes.hermesbench   # disable
 ```
 
 Change the time by editing `StartCalendarInterval` in the plist (then
-`bootout` + `bootstrap`). For a cheaper daily run, drop `HERMES_RUN_LLM_EVALS`
-from the plist env — the model-backed suites then self-skip and only the two
-deterministic suites run.
+`bootout` + `bootstrap`). `HERMES_RUN_LLM_EVALS=1` is required (every suite
+drives a real agent); for a cheaper run lower `HERMES_BENCH_TRIALS` or narrow
+with `--suite`.
 
 ## Tests
 
-`tests/hermesbench/test_hermesbench.py` — deterministic; validates the registry,
-scoring, store round-trip, report deltas, and error/skip handling. No LLM.
+`tests/hermesbench/test_hermesbench.py` — deterministic, no LLM: validates the
+registry, the judge parse/coerce + empty-reply path, the responsiveness curve,
+the category scoring + closure gate (harness and judge mocked), and the store
+round-trip / report deltas.

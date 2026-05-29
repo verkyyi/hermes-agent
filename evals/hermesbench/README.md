@@ -1,5 +1,10 @@
 # HermesBench — consolidated daily benchmark
 
+> **Methodology:** for the detailed, human-readable explanation of what each
+> suite measures, how scores and pass/fail are computed, the thresholds, and how
+> to read the dashboard, see **[METHODOLOGY.md](METHODOLOGY.md)**. This file is
+> the operational quick-reference.
+
 One runner that wraps the fork's scattered eval harnesses behind a single
 registry, persists every run to a SQLite trend store, and renders a daily
 summary with deltas vs the prior run. Built to run every day on the local

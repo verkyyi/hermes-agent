@@ -1,15 +1,16 @@
-"""Suite registry for HermesBench.
+"""Suite registry for HermesBench (v2 — black-box, default-profile, reliability-first).
 
-Each suite is metadata + a lazily-imported ``run`` callable. The callable takes
-no args and returns a dict with at least::
+Each suite is one use-case *category*. Its `run()` drives the default profile as
+an end user (isolated turn), judges the reply, and returns a normalized
+``{score: 0..100, passed: bool, metrics: {...}}`` (or ``{skipped: True,
+skip_reason}``). Suites evaluate purely from the user's perspective — no
+kanban/orchestrator internals — and weight reliability/responsiveness/closure
+above capability (see suites/usecases.py and METHODOLOGY.md).
 
-    {"score": float (0..100), "passed": bool, "metrics": dict}
-
-and may optionally return ``{"skipped": True, "skip_reason": str}``. Suites that
-need a model / credentials (orchestrator, origin_return) self-skip when
-HERMES_RUN_LLM_EVALS is unset — so a creds-less run degrades cleanly without any
-tier machinery. The runner (run.py) wraps timing and error capture around the
-call; the suite functions themselves stay simple.
+All suites drive real agents, so they self-skip when HERMES_RUN_LLM_EVALS is
+unset. The architecture-coupled internal evals (kanban scale, orchestrator
+routing, origin-return) were retired from the bench; they still exist standalone
+under evals/ and tests/stress for ad-hoc internal checks.
 """
 
 from __future__ import annotations
@@ -18,12 +19,14 @@ import importlib
 from dataclasses import dataclass
 from typing import Callable
 
-# Grading modes, mirroring ClawBench Core v1. ``automated`` suites are
-# deterministic (no model); ``hybrid`` / ``llm_judge`` suites drive a real
-# model run and self-skip without HERMES_RUN_LLM_EVALS.
-AUTOMATED = "automated"      # precise deterministic comparison
-LLM_JUDGE = "llm_judge"      # frontier model judges the outcome
-HYBRID = "hybrid"            # deterministic structure + judged quality
+from evals.hermesbench import usecases
+
+# Grading modes, mirroring ClawBench Core v1. Every v2 suite is ``hybrid``:
+# mechanical reliability signals (responded / latency / stable / concluded) plus
+# an LLM judge for conclusion-type, appropriateness, and coherence.
+AUTOMATED = "automated"
+LLM_JUDGE = "llm_judge"
+HYBRID = "hybrid"
 
 
 @dataclass(frozen=True)
@@ -41,41 +44,21 @@ class Suite:
         return getattr(mod, fn_name)
 
 
-# Order is the display order. Weights need not sum to 1 — the runner normalizes
-# over whichever suites actually ran (skipped/errored suites drop out).
+_RUNNER = "evals.hermesbench.suites.usecases:run_{}"
+
+# One suite per use-case category. Equal weight — the reliability-over-capability
+# bias lives inside each suite's score formula, not in the cross-category weights.
 _SUITES: list[Suite] = [
     Suite(
-        id="responsiveness",
-        category="Front-desk responsiveness",
-        mode=AUTOMATED,
-        weight=1.0,
-        runner="evals.hermesbench.suites.responsiveness:run",
-        summary="Pre-LLM ack accuracy, false-ack rate, progress cadence (deterministic).",
-    ),
-    Suite(
-        id="kanban_scale",
-        category="Kanban kernel scale",
-        mode=AUTOMATED,
-        weight=0.7,
-        runner="evals.hermesbench.suites.kanban_scale:run",
-        summary="Dispatch / recompute / context / query latency at 100..10k tasks.",
-    ),
-    Suite(
-        id="orchestrator",
-        category="Orchestration & routing",
+        id=cat,
+        category=usecases.CATEGORY_LABELS.get(cat, cat),
         mode=HYBRID,
         weight=1.0,
-        runner="evals.hermesbench.suites.orchestrator:run",
-        summary="Real orchestrator routing/linking accuracy over isolated boards.",
-    ),
-    Suite(
-        id="origin_return",
-        category="End-to-end task return",
-        mode=LLM_JUDGE,
-        weight=0.8,
-        runner="evals.hermesbench.suites.origin_return:run",
-        summary="Front-desk turn -> task -> completion returns to the originator.",
-    ),
+        runner=_RUNNER.format(cat),
+        summary=f"Black-box {usecases.CATEGORY_LABELS.get(cat, cat)} use cases — "
+                "closure, stability, responsiveness, appropriateness.",
+    )
+    for cat in usecases.categories()
 ]
 
 

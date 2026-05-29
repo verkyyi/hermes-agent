@@ -30,13 +30,13 @@ def test_registry_ids_unique_and_valid():
 
 def test_select_all_by_default():
     assert {s.id for s in registry.select()} == {
-        "responsiveness", "kanban_scale", "orchestrator", "origin_return",
+        "direct_answer", "quick_task", "multistep", "ambiguous", "refusal",
     }
 
 
 def test_select_by_id():
-    sel = registry.select(ids=["responsiveness"])
-    assert [s.id for s in sel] == ["responsiveness"]
+    sel = registry.select(ids=["direct_answer"])
+    assert [s.id for s in sel] == ["direct_answer"]
 
 
 def test_suite_runners_importable():
@@ -162,3 +162,76 @@ def test_report_handles_no_previous():
     cur = _mk_report("hb-1", "2026-05-28T00:00:00+00:00", 90.0, 90.0)
     out = report_mod.render(cur, None)
     assert "90.0" in out  # renders without a delta and doesn't crash
+
+
+# --------------------------------------------------------------------------- #
+# v2 judge — no real LLM calls
+# --------------------------------------------------------------------------- #
+from evals.hermesbench import judge as judge_mod  # noqa: E402
+from evals.hermesbench.suites import usecases as uc_suite  # noqa: E402
+
+
+def test_judge_empty_reply_is_none_without_model():
+    v = judge_mod.judge({"prompt": "x", "expectation": "answer"}, "")
+    assert v["conclusion_type"] == "none"
+    assert v["appropriate"] == 0.0 and v["judge_error"] is None
+
+
+def test_judge_parse_tolerates_fences_and_prose():
+    p = judge_mod._parse('here you go:\n```json\n{"conclusion_type":"completed",'
+                         '"appropriate":0.9,"coherent":1,"reason":"ok"}\n``` done')
+    assert p and p["conclusion_type"] == "completed"
+
+
+def test_judge_coerce_clamps_and_defaults():
+    c = judge_mod._coerce({"conclusion_type": "bogus", "appropriate": 5, "coherent": -1})
+    assert c["conclusion_type"] == "none"      # unknown -> none
+    assert c["appropriate"] == 1.0 and c["coherent"] == 0.0  # clamped to [0,1]
+
+
+# --------------------------------------------------------------------------- #
+# v2 scoring + closure gate — harness + judge mocked
+# --------------------------------------------------------------------------- #
+def test_responsiveness_full_credit_under_budget():
+    assert uc_suite._responsiveness(2000, 9999, 8.0) == 1.0   # 2s <= 8s budget
+    assert uc_suite._responsiveness(8000 + 16000, None, 8.0) == 0.0  # at 3x budget -> 0
+
+
+def test_run_category_skips_without_creds(monkeypatch):
+    monkeypatch.delenv("HERMES_RUN_LLM_EVALS", raising=False)
+    out = uc_suite._run_category("direct_answer")
+    assert out["skipped"] is True
+
+
+def _mech(concluded=True, stable=True):
+    return {"reply": "x", "concluded": concluded, "stable": stable,
+            "responded": True, "ttfa_ms": 1500, "ttlt_ms": 3000, "wall_ms": 1600}
+
+
+def test_run_category_all_pass(monkeypatch):
+    monkeypatch.setenv("HERMES_RUN_LLM_EVALS", "1")
+    monkeypatch.setattr(uc_suite, "TRIALS", 1)
+    monkeypatch.setattr(uc_suite, "CONCURRENCY", 1)
+    monkeypatch.setattr(uc_suite.harness, "run_case", lambda *a, **k: _mech())
+    monkeypatch.setattr(uc_suite.judge_mod, "judge", lambda case, reply: {
+        "conclusion_type": "completed", "appropriate": 1.0, "coherent": 1.0,
+        "reason": "ok", "judge_error": None})
+    out = uc_suite._run_category("direct_answer")
+    assert out["passed"] is True
+    assert out["score"] == 100.0
+    assert out["metrics"]["closure_rate"] == 1.0
+
+
+def test_run_category_no_conclusion_fails_even_if_appropriate(monkeypatch):
+    # Closure is the hard gate: a stable, on-topic reply that the judge rules
+    # 'none' (no genuine conclusion) must FAIL regardless of other scores.
+    monkeypatch.setenv("HERMES_RUN_LLM_EVALS", "1")
+    monkeypatch.setattr(uc_suite, "TRIALS", 1)
+    monkeypatch.setattr(uc_suite, "CONCURRENCY", 1)
+    monkeypatch.setattr(uc_suite.harness, "run_case", lambda *a, **k: _mech(concluded=False))
+    monkeypatch.setattr(uc_suite.judge_mod, "judge", lambda case, reply: {
+        "conclusion_type": "none", "appropriate": 0.9, "coherent": 0.9,
+        "reason": "stall", "judge_error": None})
+    out = uc_suite._run_category("direct_answer")
+    assert out["passed"] is False
+    assert out["metrics"]["closure_rate"] == 0.0

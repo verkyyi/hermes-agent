@@ -1,4 +1,4 @@
-# HermesBench — benchmark methodology
+# HermesBench — benchmark methodology (v2)
 
 This document explains *what* HermesBench measures, *how* each number is
 produced, and *how to read* the results. For run commands and operations see
@@ -6,283 +6,218 @@ produced, and *how to read* the results. For run commands and operations see
 
 ---
 
-## 1. What it is, and why
+## 1. What it is, and the philosophy
 
-Hermes accumulated several separate eval harnesses over time — front-desk
-responsiveness, Kanban kernel scale, orchestrator routing, end-to-end task
-return. Each was run by hand, ad hoc, with no shared score and no history.
+HermesBench is a **black-box reliability benchmark for the default profile** —
+the front-desk assistant the user actually talks to. It evaluates **only from
+the end user's perspective**: send a prompt, observe what comes back. It never
+inspects internal mechanics (kanban boards, orchestrator routing, task linking,
+dispatch). Four principles, in priority order:
 
-**HermesBench consolidates them into one runner that produces a single,
-comparable score every day and stores it as a time series.** The goal is not a
-leaderboard number for its own sake; it's a *regression tripwire* for the local
-deployment: if a change quietly degrades responsiveness, orchestration accuracy,
-or kernel latency, the daily score moves and you see it on the dashboard.
+1. **Default-profile, end-user view.** Drive the agent like a user; judge the
+   reply, nothing else.
+2. **Architecture-agnostic.** No assertions about internals. You can rip out and
+   replace kanban/orchestrator and this benchmark still measures the same
+   user-facing contract. (The previous version inspected board state and broke
+   whenever the architecture moved — that coupling is the thing we removed.)
+3. **Reliability > capability.** *Does it always respond, stay stable, feel
+   responsive, and reach closure* matters more than *can it solve a hard
+   problem.* Capability is better measured by external benchmarks; this one is
+   an operational-reliability tripwire.
+4. **Every prompt reaches a conclusion.** Whatever the request — answered,
+   refused, or clarified — the turn must terminate with a genuine conclusion.
+   Never a hang, crash, or silent drop. **Closure is the headline contract.**
 
 ### The harness-effect principle
 
-A central lesson from 2026 agent-eval research is that the **measurement
-harness, not just the model, determines the score** — identical model weights
-swing 10–50 points across different harnesses. The implication for a *trend*
-benchmark is strict: **the harness must stay fixed, and every run must record
-what it was.** A score drop should be attributable to the change under test, not
-to a change in how we measured. HermesBench therefore stamps every run with a
-**harness fingerprint** (see §5) and avoids silently altering scoring logic.
+Identical model weights swing 10–50 points across measurement harnesses, so a
+*trend* benchmark must keep the harness fixed and record what it was. Every run
+stamps a **harness fingerprint** (git sha, model id, profile hash; see §7).
 
 ---
 
 ## 2. Structure
 
 ```
-registry  →  suites  →  runner  →  store  →  report / dashboard
+usecases (dataset) ─┐
+harness (drive) ────┼─► suites (one per category) ─► runner ─► store ─► report / dashboard
+judge (LLM verdict)─┘
 ```
 
-- **registry** (`registry.py`) declares the suites and their metadata: id,
-  category, grading **mode**, and **weight**.
-- **suites** (`suites/*.py`) are thin adapters. Each wraps an existing harness
-  and returns a normalized `{score: 0–100, passed: bool, metrics: {...}}`
-  (or `{skipped: True, skip_reason}`). They do not re-implement the underlying
-  evals — they call them and normalize the result.
-- **runner** (`run.py`) runs every registered suite (or a `--suite a,b` subset),
-  executes each with timing + error capture, computes the weighted overall, and
-  writes the run.
-- **store** (`store.py`) appends the run to a SQLite time series.
-- **report** (`report.py`) renders a text summary with deltas vs the prior run;
-  the **dashboard plugin** renders the trend visually.
+- **`usecases.py`** — the dataset: prompts grouped into categories, each with an
+  `expectation` (the closure the user should get).
+- **`harness.py`** — drives the default profile in an isolated turn and returns
+  the reply + mechanical signals.
+- **`judge.py`** — an LLM rules on the parts only judgement can assess.
+- **`suites/usecases.py`** — one `run()` per category: drive + judge across
+  trials, aggregate to `{score, passed, metrics}`.
+- **`registry.py`** — lists the categories as suites.
+- **`run.py` / `store.py` / `report.py`** — execute, persist to a SQLite time
+  series, render with deltas. The dashboard plugin renders the trend.
 
-There is no "tier" concept. Every suite runs on every invocation. The
-model-backed suites self-gate (next section), so a credential-less run still
-works — it just records those suites as skipped.
+There is no tier concept. Every suite drives a real agent, so all suites
+**self-skip** when `HERMES_RUN_LLM_EVALS` is unset.
 
 ---
 
-## 3. Grading modes
+## 3. Grading: mechanical core + LLM judge
 
-Mirroring ClawBench Core v1's design, each suite declares how it grades:
+A subtlety: "reliability > capability" and "embrace LLM judgement" are in mild
+tension — the reliability signals (responded? how fast? crashed? concluded?) are
+exactly what you want measured **deterministically**, not by a judge. So every
+suite is **hybrid**:
 
-- **automated** — a precise, deterministic check (policy decision, latency
-  threshold). No model, no credentials; reproducible bit-for-bit.
-- **llm_judge** — outcome judged by a real agent run / model behaviour.
-  Non-deterministic by nature.
-- **hybrid** — deterministic structural checks combined with model-driven
-  behaviour.
+- **Mechanical** (from the harness, deterministic): `responded`, time-to-first-
+  answer (`ttfa_ms`), total latency (`ttlt_ms`), `stable` (no crash/timeout/
+  error), `concluded` (a terminal reply arrived within budget).
+- **LLM-judged** (from `judge.py`): `conclusion_type` ∈
+  {`completed`, `rejected`, `clarification`, **`none`**}, `appropriate` (0–1,
+  vs the case's expectation), `coherent` (0–1).
 
-| Suite | Category | Mode | Weight | Needs a model? |
-|-------|----------|------|--------|----------------|
-| `responsiveness` | Front-desk responsiveness | automated | 1.0 | no |
-| `kanban_scale`   | Kanban kernel scale       | automated | 0.7 | no |
-| `orchestrator`   | Orchestration & routing   | hybrid    | 1.0 | yes |
-| `origin_return`  | End-to-end task return    | llm_judge | 0.8 | yes |
-
-**Self-gating instead of tiers.** The two model-backed suites (`orchestrator`,
-`origin_return`) check `HERMES_RUN_LLM_EVALS` themselves and return *skipped*
-when it isn't set. So a run with no credentials degrades cleanly to the two
-deterministic suites — no tier flag required. The daily launchd job sets
-`HERMES_RUN_LLM_EVALS=1`, so it runs all four; an ad-hoc local run without the
-env var runs the two free ones. Use `--suite responsiveness,kanban_scale` to
-force a deterministic-only subset explicitly.
+Closure is where the two meet: a genuine conclusion requires *both* a terminal
+reply (mechanical) *and* the judge ruling it isn't a stall (`none`).
 
 ---
 
-## 4. The suites in detail
+## 4. The black-box harness
 
-Each suite yields a **0–100 score** and a **pass/fail**. The score feeds the
-trend; the pass/fail feeds the run verdict (§5).
+For each case the harness runs, in its **own throwaway `HERMES_HOME`** (config +
+creds copied from the default profile):
 
-### 4.1 `responsiveness` — front-desk responsiveness (automated)
+```
+hermes chat -q "<prompt>" --quiet
+```
 
-**Wraps** `evals/responsiveness` — the deterministic pre-LLM-ack + public
-progress-cadence policy benchmark. It drives the real gateway decision functions
-over ~60 emulated user turns (trivial / short / long-work / command, DM vs
-group) with ground-truth expectations. No model, no DB.
+It captures **stdout** (the reply) plus the per-home `telemetry.db` row
+(`ttfa_ms`, `ttlt_ms`, status) and wall-clock. Isolation means runs never touch
+real chats or the production board, and each run gets an unambiguous latency
+row. (Same isolation pattern as `evals/responsiveness/run_live`.)
 
-**What it checks**
-- *Ack accuracy* — for every turn, did the gateway make the correct
-  acknowledge / don't-acknowledge decision?
-- *False-ack rate* — did it ever ack a trivial / short / command turn it
-  shouldn't have?
-- *Time-to-first-feedback (TTFF)* on long-work turns, modeled from calibrated
-  latencies (`ACK_LATENCY_S`=0.3 s for acked turns).
-- *Progress cadence* — for long-running turns, is the public progress-notice
-  cadence well-formed (first notice timing, re-notice interval)?
-
-**Score** = `100 × (0.4·ack_accuracy + 0.3·(1 − false_ack_rate) + 0.3·cadence_ok_rate)`
-
-**Pass** mirrors the underlying benchmark's own thresholds, all of which are
-strict:
-
-| Metric | Threshold |
-|--------|-----------|
-| ack_accuracy | = 1.0 (every decision correct) |
-| false_ack_rate | = 0.0 (never spam) |
-| long_work p95 TTFF | ≤ 0.301 s (sub-second feedback on acked long turns) |
-| cadence_ok_rate | = 1.0 |
-
-### 4.2 `kanban_scale` — Kanban kernel scale (automated)
-
-**Wraps** `tests/stress/test_benchmarks.py`, run in an **isolated subprocess**
-(it mutates `HERMES_HOME` and `rmtree`s temp dirs, so it cannot run in-process
-without clobbering the runner). It seeds boards at 100 / 1 000 / 10 000 tasks
-and times kernel operations: `dispatch_once`, `recompute_ready`,
-`build_worker_context`, `list_tasks`, `board_stats`, `list_runs` — 17 benches
-total, median ms each.
-
-**Score** = `100 × (benches under the ceiling / total benches)`,
-where the ceiling is a deliberately generous **5 000 ms**
-(`HERMES_BENCH_KANBAN_CEILING_MS`). **Pass** = worst median ≤ ceiling.
-
-**Important nuance:** the absolute ceiling only catches *gross* (order-of-
-magnitude) regressions — kernel latency is machine-dependent, so an absolute
-pass/fail can't be tight. Finer drift is meant to be read from the **trend**:
-the per-bench medians are stored, and a 2× slowdown shows as a falling line on
-the dashboard even while the suite still "passes". Treat this suite's score as a
-coarse gate and its stored medians as the real signal.
-
-### 4.3 `orchestrator` — orchestration & routing (hybrid)
-
-**Wraps** `evals/orchestrator_routing`. Spawns the **real orchestrator** over
-**7 routing cases**, each on a throwaway **isolated** Kanban board (a temp
-`HERMES_KANBAN_DB`, no real worker spawns, kanban toolset only). Default
-**1 trial** per case (`HERMES_EVAL_TRIALS`), concurrency 3. Self-skips without
-`HERMES_RUN_LLM_EVALS`.
-
-The 7 cases: `web_research`, `ops_file_config`, `code_pr`, `light_synthesis`,
-`report_briefing`, `multi_research_plus_ops`, `ambiguous_clarify`.
-
-**What each case checks** (structural, deterministic on the resulting board):
-- `routed` — work was decomposed into ≥1 subtask
-- `self_completed` — the orchestrator's own task reached done/archived
-- `linked` — direct children link back to the root
-- `correct_assignee` — the expected worker profile(s) were targeted
-- `single_subtask` (single-route) / `single_sink` + `all_converge` +
-  `fanin_ok` (multi-route fan-in)
-- *clarify* case inverts: an ambiguous request must end **blocked for
-  clarification** with **no work created**
-- notification-mode checks (`synthesize` / `leaves_silent`) apply only when the
-  mode is observable; headless/unobservable never fails the case (the hybrid
-  part — structure carries the verdict, mode strictness only *blocks* on an
-  observed-wrong value)
-
-**Score** = `100 × pass_rate` (fraction of case×trial attempts that pass all
-their critical components). **Pass** = pass_rate ≥ **0.8**
-(`HERMES_BENCH_ORCH_PASS`).
-
-### 4.4 `origin_return` — end-to-end task return (llm_judge)
-
-**Wraps** `evals/origin_return`. Two phases run with the real local profile:
-- **phase A** — a front-desk turn must create a Kanban task *with the origin
-  subscription attached* (so the eventual completion can return to the user).
-- **phase B** — after the orchestrator self-parks (`kanban_decompose`), the
-  return path must **survive on a non-done anchor** — a subscription left only
-  on a done task means the user's answer can never come back.
-
-**Score** = `100 × (phases passed / phases run)`. **Pass** = all run phases
-passed. Phase B is reported as **skipped** (not failed) when the orchestrator
-profile isn't installed. Self-skips without `HERMES_RUN_LLM_EVALS`.
-
-> **Isolation caveat:** unlike `orchestrator` (fully isolated throwaway board),
-> this suite exercises the real front-desk → kanban path and currently reads the
-> **default local kanban board**. It therefore requires a healthy local
-> `kanban.db` and is *not* safe against a corrupt one — a corrupt board makes it
-> error out (this is how the 2026-05-28 corruption incident was surfaced). See
-> Limitations (§8).
+> **Isolation caveat.** This drives a single synchronous front-desk turn, so the
+> "conclusion" is the **turn-terminal reply** (answer / refusal / clarification /
+> clear acknowledgment). It does **not** exercise async worker-delegated closure
+> (kanban → worker → async return), which needs a gateway-based harness — that's
+> a known gap (§9). The prompts are chosen to be resolvable in one turn. `chat -q`
+> also has no gateway pre-LLM fast-ack, so the responsiveness signal is *total
+> time to the reply*, not the sub-second front-desk ack (that's a gateway
+> property the standalone responsiveness eval covers).
 
 ---
 
-## 5. Aggregation, verdict, and the fingerprint
+## 5. The judge
 
-**Overall score** = the **weighted mean** of the scores of suites that actually
-ran (skipped and errored suites drop out of both numerator and denominator).
-Weights are in the table in §3.
+`judge.py` calls `agent.auxiliary_client.call_llm` (which auto-resolves the
+default profile's provider/model, so the judge runs on the user's own model
+family). It's told the case's `expectation` and rules:
 
-**Run verdict (`passed`)** = *no suite that ran failed.* An errored suite counts
-as a failure; a skipped suite does not. So a run with no credentials (the two
-model suites skipped) can still pass on its deterministic suites alone.
+- `conclusion_type` — `completed` / `rejected` / `clarification` / `none`.
+  **`none`** is the failure: a stall, an empty/dangling reply, an "I'll get back
+  to you" with nothing, or an off-topic non-answer.
+- `appropriate` (0–1) — how well the behaviour matches the expectation (e.g. an
+  *ambiguous* prompt should get `clarification`, not an invented answer; an
+  *unknowable* prompt should be `rejected`, not fabricated).
+- `coherent` (0–1) — clear, on-topic, non-contradictory.
 
-**Harness fingerprint** — every run records:
-- `git_sha` — the checkout the run executed from
-- `model_id` — resolved from the local profile config (e.g. `gpt-5.5`)
-- `profile_hash` — SHA-256 of the profile `config.yaml`
-
-This is what makes day-over-day comparison meaningful: when the score moves, you
-can tell whether the *code*, the *model*, or the *profile* changed underneath
-it.
-
----
-
-## 6. The trend store
-
-Runs append to **`$HERMES_HOME/hermesbench.db`** (SQLite): a `runs` table
-(run_id, ts, overall_score, passed, suites_ran, fingerprint) and a
-`suite_results` table (per-suite score, passed, skipped, error, duration, and a
-JSON `metrics` blob).
-
-It uses a **rollback journal with `synchronous=FULL`, deliberately not WAL.**
-Writes are once-daily and single-process, so WAL buys nothing — and the failure
-mode it avoids (a torn WAL checkpoint under concurrent writers) is the same class
-that corrupted the gateway's `kanban.db` on 2026-05-27. A conservative journal
-removes that risk for this store entirely, independent of how the kanban kernel
-manages its own WAL.
+An empty reply is ruled `none` without a model call. If the judge model itself
+errors, that trial's judged axis is left unscored (`judge_error`) rather than
+blamed on the agent.
 
 ---
 
-## 7. Reading the dashboard
+## 6. Use-case categories
 
-The trend tab (`/hermesbench`) renders three things:
+Each category is a suite (and a per-category dashboard trend). `expectation`
+drives the judge's appropriateness ruling:
 
-1. **Overall score**: a single line — each run's weighted `overall_score` over
-   time.
-2. **Per-category trends**: one small line chart per suite, each showing that
-   suite's score over time with its latest value. This is where you localize a
-   regression — a drop in the overall line is explained by whichever
-   per-category chart fell. A suite that skipped/errored on a given run simply
-   has no point there.
-3. **Recent runs table**: per-run overall and each suite's score (with skip/err
-   markers).
+| Category | Label | Expectation | Good closure |
+|----------|-------|-------------|--------------|
+| `direct_answer` | Direct answer | `answer` | answers the question (`completed`) |
+| `quick_task` | Quick task | `task_done` | does the small task in-turn (`completed`) |
+| `multistep` | Multi-step reasoning | `task_done` | synthesizes a result, doesn't just dispatch (`completed`) |
+| `ambiguous` | Ambiguous → clarify | `clarify` | asks a focused question (`clarification`), doesn't guess |
+| `refusal` | Refusal → clear decline | `refuse` | declines / states the limit clearly (`rejected`), doesn't fabricate |
 
-A line needs ≥2 points to draw, so with few runs you'll see dots until history
-accumulates.
-
-### How to interpret a move
-- **Overall down, one category down** → localized regression; read that suite's
-  metrics in the run JSON (`--json`) or the table.
-- **`kanban_scale` still "passing" but its line falling** → latency drift below
-  the gross ceiling; compare stored per-bench medians.
-- **A model suite shows skip / err** → `HERMES_RUN_LLM_EVALS` was unset, creds
-  were missing, or (for `origin_return`) the local kanban board was unhealthy —
-  not necessarily a model regression.
-- **Overall moved but no category did** → check the fingerprint: a `model_id`
-  or `profile_hash` change means the *measurement* moved, per §1.
+Add cases by editing `usecases.py` (and a budget + label for a new category).
 
 ---
 
-## 8. Known limitations
+## 7. Scoring, verdict, and the fingerprint
 
-- **`origin_return` is not fully isolated** from the production `kanban.db` (see
-  §4.4) — it requires a healthy local board and errors on a corrupt one.
-- **No token / cost instrumentation.** Cost of a model-backed run is described
-  by its agent-run count (~9 turns) and wall-clock, not a measured dollar figure.
-- **Kanban ceiling is coarse and machine-dependent.** The absolute pass/fail
-  catches only ~order-of-magnitude regressions; rely on the median trend for
-  drift.
-- **Orchestrator default is 1 trial/case** → susceptible to single-run noise on
-  a non-deterministic model. Raise `HERMES_EVAL_TRIALS` for a tighter estimate.
-- **llm_judge / hybrid suites are non-deterministic** — a one-off dip may be
-  variance, not regression; confirm with a second run before acting.
-- **`profile_hash` only covers `config.yaml`**, not `.env` or installed skills.
+**Per category** (over all its prompts × trials), weighting reliability far
+above capability:
+
+```
+score = 100 · (0.40·closure_rate + 0.20·stable_rate
+               + 0.15·responsiveness_mean + 0.25·appropriate_mean)
+```
+
+- `closure_rate` — fraction of trials reaching a genuine conclusion (mechanical
+  concluded **and** judge ≠ `none`).
+- `stable_rate` — fraction with no crash/timeout/error.
+- `responsiveness_mean` — per trial, a time-to-reply score: 1.0 at/under the
+  category's `reply_target_s`, decaying linearly to 0 at 3×. Uses telemetry
+  `ttfa_ms` when present, else wall-clock (this one-shot harness has no gateway
+  fast-ack, so it's total time to the single reply).
+- `appropriate_mean` — judge appropriateness over trials with a valid verdict.
+
+**Pass** is gated on reliability: `closure_rate == 1.0` **and**
+`stable_rate == 1.0` **and** `appropriate_mean ≥ 0.7`. A correct-but-never-
+concluding turn fails; closure is non-negotiable.
+
+**Overall score** = weighted mean of the categories that ran (skipped/errored
+drop out). **Run verdict** = no suite that ran failed. **Fingerprint** per run:
+`git_sha`, `model_id`, `profile_hash` — so a score move is attributable to the
+*change*, not the *measurement*.
+
+Trials default to 2 per case (`HERMES_BENCH_TRIALS`); concurrency
+`HERMES_BENCH_CONCURRENCY` (default 4). More trials = a steadier estimate on a
+non-deterministic system, at more tokens/time.
 
 ---
 
-## 9. Extending it
+## 8. Trend store + dashboard
 
-Add a suite by (1) writing `suites/<id>.py` exposing `run() -> {score, passed,
-metrics}` (or `{skipped, skip_reason}`), and (2) registering it in
-`registry.py` with its category, mode, and weight. If it needs a model, have its
-`run()` return `{skipped: True}` when `HERMES_RUN_LLM_EVALS` is unset, mirroring
-the existing model suites. The runner, store, report, and dashboard pick it up
-automatically — the per-category chart and the table add a column with no
-further changes. Keep heavy imports *inside* `run()` so a deterministic-only run
-never pays for a model suite's dependencies.
+Runs append to **`$HERMES_HOME/hermesbench.db`** (SQLite, rollback journal +
+`synchronous=FULL`, deliberately not WAL — avoids the torn-WAL-checkpoint
+failure class, independent of the kanban kernel's own WAL).
 
-`tests/hermesbench/test_hermesbench.py` validates the registry, scoring
-normalization, store round-trip, report deltas, and error/skip handling — extend
-it alongside any new suite.
+The dashboard tab (`/hermesbench`, a bundled plugin) shows a single **Overall
+score** line, **per-category trend** charts (one per category above), and a
+recent-runs table. A line needs ≥2 points to draw.
+
+**Reading a move:** overall down + one category down → localized; open the run
+JSON (`--json`) for that category's `metrics` (closure/stable/appropriate +
+`failures` sample + `conclusion_types`). A category flips to skip → creds
+missing. Overall moved but no category did → check the fingerprint.
+
+---
+
+## 9. Known limitations
+
+- **Async-delegated closure is not tested.** The harness measures the single
+  front-desk turn; tasks that delegate to a worker and return asynchronously
+  need a gateway-based harness (future work). Prompts are chosen to conclude
+  in-turn.
+- **Non-deterministic.** Real agent + LLM judge → run-to-run variance. Use more
+  trials and read the trend, not a single run.
+- **No token / cost instrumentation.** Cost ≈ (cases × trials) agent turns +
+  one judge call each; not a measured dollar figure.
+- **Judge shares the user's model family** (cheap + representative, but some
+  self-grading bias; the rubric + low temperature mitigate it).
+- **Small dataset** — a tripwire, not a comprehensive capability eval. Grow
+  `usecases.py` over time.
+
+---
+
+## 10. Extending it
+
+Add a prompt to an existing category in `usecases.py`, or add a category:
+(1) add cases with a new `category` + `expectation`, a `BUDGETS` entry, and a
+`CATEGORY_LABELS` entry; (2) add a `run_<category>()` wrapper in
+`suites/usecases.py`. The registry builds suites from `usecases.categories()`
+automatically, and the store/report/dashboard pick it up — a new per-category
+chart and table column appear with no further changes.
+
+`tests/hermesbench/test_hermesbench.py` validates the registry, the judge parse/
+coerce, the responsiveness curve, and the category scoring + closure gate (with
+the harness and judge mocked — no real LLM) — extend it alongside any new suite.

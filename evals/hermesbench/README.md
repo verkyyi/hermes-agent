@@ -60,9 +60,27 @@ effect" (identical weights swing 10-50 pts across harnesses).
 
 ## Scheduling
 
-Not wired yet — run manually or add a launchd job
-(`ai.hermes.hermesbench`, mirroring `ai.hermes.gateway`/`ai.hermes.dashboard`)
-later.
+Runs daily via the launchd agent **`ai.hermes.hermesbench`** (host artifact at
+`~/Library/LaunchAgents/`, not tracked in-repo — same convention as
+`ai.hermes.gateway`/`ai.hermes.dashboard`):
+
+- **When:** `StartCalendarInterval` Hour=4, Minute=0 — daily at 04:00 local. A
+  one-shot job (no `KeepAlive`/`RunAtLoad`); launchd runs missed fires on wake.
+- **What:** `venv/bin/python -m evals.hermesbench.run` (full tier) with
+  `HERMES_RUN_LLM_EVALS=1` in the plist env, so the live suites run too.
+- **Logs:** `~/.hermes/logs/hermesbench.log` / `.error.log`.
+
+Manage it:
+
+```bash
+launchctl print gui/$(id -u)/ai.hermes.hermesbench     # status + next fire
+launchctl kickstart -k gui/$(id -u)/ai.hermes.hermesbench   # run now (full live)
+launchctl bootout gui/$(id -u)/ai.hermes.hermesbench   # disable
+```
+
+Change the time by editing `StartCalendarInterval` in the plist (then
+`bootout` + `bootstrap`). For a cheaper daily run, drop `HERMES_RUN_LLM_EVALS`
+from the plist env and add `--tier core` to the args.
 
 ## Tests
 

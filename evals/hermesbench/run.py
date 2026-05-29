@@ -1,15 +1,14 @@
 """HermesBench — single consolidated benchmark runner.
 
-    venv/bin/python -m evals.hermesbench.run                 # full (core + live)
-    venv/bin/python -m evals.hermesbench.run --tier core     # deterministic only
-    venv/bin/python -m evals.hermesbench.run --tier live     # live suites only
+    venv/bin/python -m evals.hermesbench.run                 # run all suites
     venv/bin/python -m evals.hermesbench.run --suite responsiveness,kanban_scale
     venv/bin/python -m evals.hermesbench.run --json          # machine-readable
     venv/bin/python -m evals.hermesbench.run --no-store      # don't persist
 
-Default tier is ``full``: live suites run when HERMES_RUN_LLM_EVALS is set,
-otherwise they are recorded as skipped (not failed). Exits non-zero if any suite
-that actually ran failed.
+Runs every registered suite. The model-backed suites (orchestrator,
+origin_return) self-skip when HERMES_RUN_LLM_EVALS is unset, so a creds-less run
+degrades cleanly to the deterministic suites and is recorded as skipped (not
+failed). Exits non-zero if any suite that actually ran failed.
 """
 
 from __future__ import annotations
@@ -71,17 +70,15 @@ def _profile_hash() -> str | None:
     return None
 
 
-def _execute(suite: registry.Suite, *, live_enabled: bool) -> dict:
+def _execute(suite: registry.Suite) -> dict:
     base = {
         "id": suite.id, "category": suite.category, "mode": suite.mode,
-        "tier": suite.tier, "weight": suite.weight, "summary": suite.summary,
+        "weight": suite.weight, "summary": suite.summary,
         "score": None, "passed": None, "skipped": False,
         "skip_reason": None, "error": None, "duration_s": 0.0, "metrics": {},
     }
-    if suite.tier == registry.LIVE and not live_enabled:
-        base.update(skipped=True, skip_reason="live tier: HERMES_RUN_LLM_EVALS not set")
-        return base
-
+    # Suites that need a model self-skip when HERMES_RUN_LLM_EVALS is unset
+    # (see their run()), so there's no gating to do here.
     t0 = time.perf_counter()
     try:
         out = suite.load()()
@@ -100,12 +97,10 @@ def _execute(suite: registry.Suite, *, live_enabled: bool) -> dict:
     return base
 
 
-def run_benchmark(*, tier: str = "full", ids: list[str] | None = None) -> dict:
-    live_enabled = bool(os.environ.get("HERMES_RUN_LLM_EVALS"))
-    select_tier = None if tier == "full" else tier
-    suites = registry.select(tier=select_tier, ids=ids)
+def run_benchmark(*, ids: list[str] | None = None) -> dict:
+    suites = registry.select(ids=ids)
 
-    results = [_execute(s, live_enabled=live_enabled) for s in suites]
+    results = [_execute(s) for s in suites]
 
     ran = [r for r in results if not r["skipped"] and not r["error"] and r["score"] is not None]
     if ran:
@@ -121,7 +116,6 @@ def run_benchmark(*, tier: str = "full", ids: list[str] | None = None) -> dict:
     return {
         "run_id": "hb-" + now.strftime("%Y%m%dT%H%M%SZ"),
         "ts": now.isoformat(),
-        "tier": tier,
         "overall_score": overall,
         "passed": passed,
         "suites_ran": len(ran),
@@ -136,14 +130,13 @@ def run_benchmark(*, tier: str = "full", ids: list[str] | None = None) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="hermesbench")
-    ap.add_argument("--tier", choices=["full", "core", "live"], default="full")
     ap.add_argument("--suite", help="comma-separated suite ids to restrict to")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--no-store", action="store_true", help="do not persist to the trend store")
     args = ap.parse_args(argv)
 
     ids = [s for s in (args.suite or "").split(",") if s] or None
-    report = run_benchmark(tier=args.tier, ids=ids)
+    report = run_benchmark(ids=ids)
 
     previous = None
     if not args.no_store:

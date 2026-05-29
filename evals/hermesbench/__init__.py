@@ -6,8 +6,10 @@ every run to a SQLite trend store, and renders a daily summary with deltas vs a
 rolling baseline.
 
 Design notes:
-  - Suites declare a *tier*: ``core`` (deterministic, no LLM, no creds) or
-    ``live`` (real LLM on the local profile, gated by HERMES_RUN_LLM_EVALS).
+  - Every suite runs on every invocation — there is no tier concept. The
+    model-backed suites (orchestrator, origin_return) self-skip when
+    HERMES_RUN_LLM_EVALS is unset, so a creds-less run degrades cleanly to the
+    deterministic suites.
   - Suites declare a *mode* mirroring ClawBench Core v1: ``automated`` (precise
     deterministic check), ``llm_judge``, or ``hybrid``.
   - The harness is pinned: every run records git sha, model id and a profile
@@ -15,7 +17,7 @@ Design notes:
     (the "harness effect" — same weights swing 10-50pts across harnesses).
 
 Entry point:
-    venv/bin/python -m evals.hermesbench.run            # full (core + live)
-    venv/bin/python -m evals.hermesbench.run --tier core
+    venv/bin/python -m evals.hermesbench.run            # all suites
+    venv/bin/python -m evals.hermesbench.run --suite responsiveness,kanban_scale
     venv/bin/python -m evals.hermesbench.run --json
 """

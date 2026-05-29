@@ -1,4 +1,4 @@
-"""Orchestrator suite — wraps evals.orchestrator_routing (hybrid, live tier).
+"""Orchestrator suite — wraps evals.orchestrator_routing (hybrid; needs a model).
 
 Spawns the real orchestrator over isolated throwaway boards and scores routing /
 linking / notification correctness. Live: needs HERMES_RUN_LLM_EVALS and the

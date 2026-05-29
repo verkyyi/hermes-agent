@@ -1,4 +1,4 @@
-"""Responsiveness suite — wraps evals.responsiveness (deterministic, core tier).
+"""Responsiveness suite — wraps evals.responsiveness (automated, deterministic).
 
 Score is a composite of the three policy metrics that gate the underlying
 benchmark: ack accuracy, the complement of the false-ack rate, and progress

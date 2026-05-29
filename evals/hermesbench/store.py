@@ -24,7 +24,6 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     run_id        TEXT PRIMARY KEY,
     ts            TEXT NOT NULL,           -- ISO8601 UTC, supplied by caller
-    tier          TEXT NOT NULL,           -- full | core | live
     overall_score REAL,                    -- weighted over suites that ran
     passed        INTEGER NOT NULL,        -- 1/0
     suites_ran    INTEGER NOT NULL,
@@ -37,7 +36,6 @@ CREATE TABLE IF NOT EXISTS suite_results (
     suite_id    TEXT NOT NULL,
     category    TEXT,
     mode        TEXT,
-    tier        TEXT,
     score       REAL,
     passed      INTEGER,
     skipped     INTEGER NOT NULL DEFAULT 0,
@@ -81,11 +79,11 @@ def save_run(report: dict, db_path: Path | None = None) -> None:
         h = report["harness"]
         conn.execute(
             "INSERT OR REPLACE INTO runs "
-            "(run_id, ts, tier, overall_score, passed, suites_ran, "
+            "(run_id, ts, overall_score, passed, suites_ran, "
             " git_sha, model_id, profile_hash) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?)",
             (
-                report["run_id"], report["ts"], report["tier"],
+                report["run_id"], report["ts"],
                 report.get("overall_score"), 1 if report["passed"] else 0,
                 report["suites_ran"],
                 h.get("git_sha"), h.get("model_id"), h.get("profile_hash"),
@@ -94,12 +92,12 @@ def save_run(report: dict, db_path: Path | None = None) -> None:
         for s in report["suites"]:
             conn.execute(
                 "INSERT OR REPLACE INTO suite_results "
-                "(run_id, suite_id, category, mode, tier, score, passed, "
+                "(run_id, suite_id, category, mode, score, passed, "
                 " skipped, skip_reason, error, duration_s, metrics) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     report["run_id"], s["id"], s.get("category"), s.get("mode"),
-                    s.get("tier"), s.get("score"),
+                    s.get("score"),
                     None if s.get("passed") is None else (1 if s["passed"] else 0),
                     1 if s.get("skipped") else 0, s.get("skip_reason"),
                     s.get("error"), s.get("duration_s"),

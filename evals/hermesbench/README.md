@@ -13,13 +13,13 @@ default profile.
 ## Run it
 
 ```bash
-# Full (core + live). Live suites run only if HERMES_RUN_LLM_EVALS is set,
-# otherwise they're recorded as skipped (not failed).
+# Runs every suite. The model-backed suites (orchestrator, origin_return)
+# self-skip unless HERMES_RUN_LLM_EVALS is set, so this degrades cleanly to
+# the two deterministic suites without credentials.
 venv/bin/python -m evals.hermesbench.run
 
-venv/bin/python -m evals.hermesbench.run --tier core      # deterministic only (no LLM/creds)
-venv/bin/python -m evals.hermesbench.run --tier live      # live suites only
-venv/bin/python -m evals.hermesbench.run --suite responsiveness,kanban_scale
+HERMES_RUN_LLM_EVALS=1 venv/bin/python -m evals.hermesbench.run   # incl. model suites
+venv/bin/python -m evals.hermesbench.run --suite responsiveness,kanban_scale  # subset
 venv/bin/python -m evals.hermesbench.run --json           # machine-readable
 venv/bin/python -m evals.hermesbench.run --no-store       # don't persist
 ```
@@ -28,12 +28,12 @@ Exit code is non-zero if any suite that actually ran failed.
 
 ## Suites
 
-| id | category | mode | tier |
+| id | category | mode | needs a model? |
 |---|---|---|---|
-| `responsiveness` | Front-desk responsiveness | automated | core |
-| `kanban_scale`   | Kanban kernel scale       | automated | core |
-| `orchestrator`   | Orchestration & routing   | hybrid    | live |
-| `origin_return`  | End-to-end task return    | llm_judge | live |
+| `responsiveness` | Front-desk responsiveness | automated | no |
+| `kanban_scale`   | Kanban kernel scale       | automated | no |
+| `orchestrator`   | Orchestration & routing   | hybrid    | yes |
+| `origin_return`  | End-to-end task return    | llm_judge | yes |
 
 Suites *wrap* the existing harnesses (`evals/responsiveness`,
 `tests/stress/test_benchmarks.py`, `evals/orchestrator_routing`,
@@ -41,21 +41,19 @@ Suites *wrap* the existing harnesses (`evals/responsiveness`,
 stress benchmark in an isolated subprocess because it mutates `HERMES_HOME`.
 
 Grading modes mirror ClawBench Core v1: `automated` (deterministic),
-`llm_judge`, `hybrid`.
-
-## Tiers
-
-- **core** — deterministic, no LLM, no credentials. Daily-safe, free, ~2 min
-  (the kanban subprocess seeds up to 10k tasks).
-- **live** — real LLM on the local profile; gated by `HERMES_RUN_LLM_EVALS=1`.
+`llm_judge`, `hybrid`. There is **no tier concept** — every suite runs each
+time; the model-backed suites self-skip without `HERMES_RUN_LLM_EVALS` (so a
+creds-less run = the two deterministic suites). See
+[METHODOLOGY.md](METHODOLOGY.md) for details.
 
 ## Trend store + dashboard
 
 Each run appends to `$HERMES_HOME/hermesbench.db` (SQLite, rollback journal +
-`synchronous=FULL` — deliberately not WAL, to avoid the torn-checkpoint failure
-mode that corrupted `kanban.db`). The dashboard serves a self-contained trend
-view at **`/hermesbench`** (overall score over time + per-suite table), backed
-by `GET /api/hermesbench/trend`.
+`synchronous=FULL` — deliberately not WAL, to avoid the torn-WAL-checkpoint
+failure class). The trend view is a **bundled dashboard plugin**
+(`plugins/hermesbench/dashboard/`): a tab at **`/hermesbench`** showing the
+overall score line + per-category trend charts + a recent-runs table, backed by
+`GET /api/plugins/hermesbench/trend`.
 
 ## Pinned harness
 
@@ -71,23 +69,24 @@ Runs daily via the launchd agent **`ai.hermes.hermesbench`** (host artifact at
 
 - **When:** `StartCalendarInterval` Hour=4, Minute=0 — daily at 04:00 local. A
   one-shot job (no `KeepAlive`/`RunAtLoad`); launchd runs missed fires on wake.
-- **What:** `venv/bin/python -m evals.hermesbench.run` (full tier) with
-  `HERMES_RUN_LLM_EVALS=1` in the plist env, so the live suites run too.
+- **What:** `venv/bin/python -m evals.hermesbench.run` with
+  `HERMES_RUN_LLM_EVALS=1` in the plist env, so the model-backed suites run too.
 - **Logs:** `~/.hermes/logs/hermesbench.log` / `.error.log`.
 
 Manage it:
 
 ```bash
 launchctl print gui/$(id -u)/ai.hermes.hermesbench     # status + next fire
-launchctl kickstart -k gui/$(id -u)/ai.hermes.hermesbench   # run now (full live)
+launchctl kickstart -k gui/$(id -u)/ai.hermes.hermesbench   # run now (incl. model suites)
 launchctl bootout gui/$(id -u)/ai.hermes.hermesbench   # disable
 ```
 
 Change the time by editing `StartCalendarInterval` in the plist (then
 `bootout` + `bootstrap`). For a cheaper daily run, drop `HERMES_RUN_LLM_EVALS`
-from the plist env and add `--tier core` to the args.
+from the plist env — the model-backed suites then self-skip and only the two
+deterministic suites run.
 
 ## Tests
 
 `tests/hermesbench/test_hermesbench.py` — deterministic; validates the registry,
-scoring, store round-trip, report deltas, and tier/error/skip handling. No LLM.
+scoring, store round-trip, report deltas, and error/skip handling. No LLM.

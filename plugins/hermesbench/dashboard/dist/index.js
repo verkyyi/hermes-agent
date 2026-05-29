@@ -11,7 +11,7 @@
   const h = React.createElement;
 
   // Fixed palette so series stay readable on any dashboard theme.
-  const TIER_COLOR = { core: "#58a6ff", live: "#a371f7" };
+  const OVERALL_COLOR = "#58a6ff";
   const SUITE_COLOR = {
     responsiveness: "#3fb950",
     kanban_scale: "#58a6ff",
@@ -20,11 +20,6 @@
   };
   const FALLBACK = "#8b949e";
 
-  function mean(xs) {
-    const v = xs.filter(function (x) { return x != null; });
-    if (!v.length) return null;
-    return v.reduce(function (a, b) { return a + b; }, 0) / v.length;
-  }
   function fmt(v) { return v == null ? "—" : Number(v).toFixed(1); }
   function suiteId(s) { return s.id || s.suite_id; }
   function suiteScore(s) {
@@ -94,7 +89,6 @@
     const tdStyle = "px-2 py-1.5 border-t border-border tabular-nums";
     const head = h("tr", null,
       h("th", { className: thStyle }, "run"),
-      h("th", { className: thStyle }, "tier"),
       h("th", { className: thStyle }, "overall"),
       ids.map(function (id) { return h("th", { key: id, className: thStyle }, id); })
     );
@@ -111,7 +105,6 @@
       const ovCls = r.passed ? "text-emerald-500" : "text-destructive";
       return h("tr", { key: r.run_id },
         h("td", { className: tdStyle }, (r.ts || "").replace("T", " ").slice(0, 16)),
-        h("td", { className: tdStyle }, r.tier),
         h("td", { className: cn(tdStyle, ovCls, "font-medium") }, fmt(r.overall_score)),
         cells
       );
@@ -140,29 +133,20 @@
     const chrono = runs.slice().reverse();
     const xMax = Math.max(1, chrono.length - 1);
 
-    // Per-run aggregate over a tier's suites (unweighted mean of scored suites).
-    function tierMean(run, tier) {
-      const ss = (run.suites || []).filter(function (s) { return s.tier === tier && suiteScore(s) != null; });
-      return mean(ss.map(function (s) { return s.score; }));
-    }
-    function tierSeries(tier, label) {
-      return {
-        label: label, color: TIER_COLOR[tier],
-        points: chrono.map(function (r, i) { return { x: i, y: tierMean(r, tier) }; })
-          .filter(function (p) { return p.y != null; }),
-      };
-    }
-    const overallSeries = [tierSeries("core", "Core"), tierSeries("live", "Live")];
+    const overallSeries = {
+      label: "Overall", color: OVERALL_COLOR,
+      points: chrono.map(function (r, i) { return { x: i, y: r.overall_score }; })
+        .filter(function (p) { return p.y != null; }),
+    };
 
-    // Discover suites (core first), preserving first-seen order within a tier.
+    // Discover suites in first-seen order.
     const meta = []; const seen = {};
     chrono.forEach(function (r) {
       (r.suites || []).forEach(function (s) {
         const id = suiteId(s);
-        if (id && !seen[id]) { seen[id] = true; meta.push({ id: id, category: s.category || id, tier: s.tier }); }
+        if (id && !seen[id]) { seen[id] = true; meta.push({ id: id, category: s.category || id, mode: s.mode || "" }); }
       });
     });
-    meta.sort(function (a, b) { return (a.tier === "core" ? 0 : 1) - (b.tier === "core" ? 0 : 1); });
     const suiteIds = meta.map(function (m) { return m.id; });
 
     function suiteSeries(id) {
@@ -182,19 +166,17 @@
     }
 
     const latest = runs[0];
-    const latestCore = latest ? tierMean(latest, "core") : null;
-    const latestLive = latest ? tierMean(latest, "live") : null;
 
     return h("div", { className: "space-y-4 p-1" },
       h("div", { className: "flex items-center justify-between" },
         h("div", null,
           h("h2", { className: "text-lg font-semibold" }, "HermesBench"),
           h("p", { className: "text-sm text-muted-foreground" },
-            "Consolidated daily benchmark — score trends by tier and category (local profile).")
+            "Consolidated daily benchmark — overall and per-category score trends (local profile).")
         ),
         h("div", { className: "flex items-center gap-2" },
-          h("span", { className: "text-xs", style: { color: TIER_COLOR.core } }, "core " + fmt(latestCore)),
-          h("span", { className: "text-xs", style: { color: TIER_COLOR.live } }, "live " + fmt(latestLive)),
+          latest ? h(Badge, { variant: latest.passed ? "default" : "destructive" },
+            "latest " + fmt(latest.overall_score)) : null,
           h(Button, { variant: "outline", size: "sm", disabled: loading, onClick: load },
             loading ? "Loading…" : "Refresh")
         )
@@ -204,8 +186,8 @@
       }, "Could not load trend: " + error) : null,
 
       h(Card, null,
-        h(CardHeader, null, h(CardTitle, { className: "text-sm" }, "Overall score — Core vs Live")),
-        h(CardContent, null, h(LineChart, { series: overallSeries, xMax: xMax, height: 220, legend: true }))
+        h(CardHeader, null, h(CardTitle, { className: "text-sm" }, "Overall score")),
+        h(CardContent, null, h(LineChart, { series: [overallSeries], xMax: xMax, height: 220 }))
       ),
 
       h(Card, null,
@@ -218,7 +200,7 @@
                   h("div", { className: "flex items-start justify-between mb-1" },
                     h("div", null,
                       h("div", { className: "text-sm font-medium" }, m.category),
-                      h("div", { className: "text-xs text-muted-foreground" }, m.id + " · " + m.tier)),
+                      h("div", { className: "text-xs text-muted-foreground" }, m.id + " · " + m.mode)),
                     h("span", { className: "text-xs tabular-nums", style: { color: color } },
                       fmt(latestSuiteScore(m.id)))
                   ),

@@ -31,7 +31,7 @@ def render(report: dict, previous: dict | None = None) -> str:
         "=" * 64,
         "HERMESBENCH  " + report["run_id"],
         "=" * 64,
-        f"ts={report['ts']}  tier={report['tier']}  suites_ran={report['suites_ran']}",
+        f"ts={report['ts']}  suites_ran={report['suites_ran']}",
         f"harness: git={(h.get('git_sha') or '?')[:10]} "
         f"model={h.get('model_id') or '?'} "
         f"profile={(h.get('profile_hash') or '?')[:10]}",
@@ -46,8 +46,8 @@ def render(report: dict, previous: dict | None = None) -> str:
         f"OVERALL  {overall_str}{_fmt_delta(overall, prev_overall)}   [{verdict}]"
     )
     lines.append("")
-    lines.append(f"  {'suite':<16}{'mode':<10}{'tier':<6}{'score':>7}  status")
-    lines.append("  " + "-" * 56)
+    lines.append(f"  {'suite':<16}{'mode':<10}{'score':>7}  status")
+    lines.append("  " + "-" * 50)
 
     for s in report["suites"]:
         prev = prev_suites.get(s["id"])
@@ -55,7 +55,7 @@ def render(report: dict, previous: dict | None = None) -> str:
         score_str = "  -  " if score is None else f"{score:6.1f}"
         delta = _fmt_delta(score, (prev or {}).get("score")) if prev else ""
         lines.append(
-            f"  {s['id']:<16}{s.get('mode',''):<10}{s.get('tier',''):<6}"
+            f"  {s['id']:<16}{s.get('mode',''):<10}"
             f"{score_str:>7}  {_suite_status(s)}{delta}"
         )
 

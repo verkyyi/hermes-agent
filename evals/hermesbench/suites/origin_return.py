@@ -1,4 +1,4 @@
-"""Origin-return suite — wraps evals.origin_return (llm_judge, live tier).
+"""Origin-return suite — wraps evals.origin_return (llm_judge; needs a model).
 
 Two phases on a real (isolated) board with the real local profile:
   (a) a front-desk turn must create a Kanban task with the origin subscription,
